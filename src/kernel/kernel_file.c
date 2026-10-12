@@ -18,6 +18,9 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <wchar.h>
+#include <wctype.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -43,6 +46,73 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
 
+/* Read-ahead: titles stream from DVD in small synchronous reads (XMV movies
+ * read 32 KB at a time from the game thread). On a host hard disk a cold read
+ * can take hundreds of ms, so when a large game file is opened for reading a
+ * worker streams it once through the OS file cache. XBOX_NO_READAHEAD=1
+ * disables it. */
+#define RA_QUEUE 32
+#define RA_SEEN 512
+static SRWLOCK s_ra_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_ra_cv = CONDITION_VARIABLE_INIT;
+static WCHAR *s_ra_queue[RA_QUEUE];
+static int s_ra_head, s_ra_count, s_ra_started;
+static unsigned s_ra_seen[RA_SEEN], s_ra_nseen;
+
+static DWORD WINAPI readahead_thread(LPVOID unused)
+{
+    static char buf[256 << 10];
+    (void)unused;
+    /* Very-low I/O priority: on a spinning disk a full-speed read-ahead of a
+     * 60 MB movie queued the game's own first reads behind it (11 s stalls
+     * when the attract cycle reached a movie it had not played yet). */
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    for (;;) {
+        WCHAR *path;
+        HANDLE f;
+        DWORD n;
+        AcquireSRWLockExclusive(&s_ra_lock);
+        while (!s_ra_count)
+            SleepConditionVariableSRW(&s_ra_cv, &s_ra_lock, INFINITE, 0);
+        path = s_ra_queue[s_ra_head];
+        s_ra_head = (s_ra_head + 1) % RA_QUEUE;
+        s_ra_count--;
+        ReleaseSRWLockExclusive(&s_ra_lock);
+        f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            while (ReadFile(f, buf, sizeof(buf), &n, NULL) && n) {}
+            CloseHandle(f);
+        }
+        free(path);
+    }
+}
+
+static void readahead_file(HANDLE h, const WCHAR *path, ACCESS_MASK access)
+{
+    static int disabled = -1;
+    LARGE_INTEGER size;
+    unsigned hash = 2166136261u;
+    if (disabled < 0) disabled = GetEnvironmentVariableA("XBOX_NO_READAHEAD", NULL, 0) > 0;
+    if (disabled || (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA))) return;
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < (256 << 10) || size.QuadPart > (96ll << 20)) return;
+    for (const WCHAR *p = path; *p; ++p) hash = (hash ^ (unsigned)towlower(*p)) * 16777619u;
+    AcquireSRWLockExclusive(&s_ra_lock);
+    for (unsigned i = 0; i < s_ra_nseen; ++i)
+        if (s_ra_seen[i] == hash) { ReleaseSRWLockExclusive(&s_ra_lock); return; }
+    if (s_ra_nseen < RA_SEEN) s_ra_seen[s_ra_nseen++] = hash;
+    if (s_ra_count < RA_QUEUE) {
+        s_ra_queue[(s_ra_head + s_ra_count) % RA_QUEUE] = _wcsdup(path);
+        s_ra_count++;
+        WakeConditionVariable(&s_ra_cv);
+    }
+    if (!s_ra_started) {
+        s_ra_started = 1;
+        CloseHandle(CreateThread(NULL, 0, readahead_thread, NULL, 0, NULL));
+    }
+    ReleaseSRWLockExclusive(&s_ra_lock);
+}
+
 /* Convert Xbox create disposition to Win32 */
 static DWORD xbox_disposition_to_win32(ULONG Disposition)
 {
@@ -63,7 +133,11 @@ static DWORD xbox_access_to_win32(ACCESS_MASK Access)
     DWORD result = 0;
     if (Access & XBOX_GENERIC_READ)           result |= GENERIC_READ;
     if (Access & XBOX_GENERIC_WRITE)          result |= GENERIC_WRITE;
-    if (Access & XBOX_GENERIC_ALL)            result |= GENERIC_ALL;
+    /* Xbox GENERIC_ALL is used by titles as an ordinary read/write file
+     * request.  Passing host GENERIC_ALL also asks Windows for ownership and
+     * ACL-management rights, which is both unnecessary and commonly denied
+     * in sandboxed or shared workspaces. */
+    if (Access & XBOX_GENERIC_ALL)            result |= GENERIC_READ | GENERIC_WRITE;
     if (Access & XBOX_FILE_READ_DATA)         result |= FILE_READ_DATA;
     if (Access & XBOX_FILE_WRITE_DATA)        result |= FILE_WRITE_DATA;
     if (Access & XBOX_FILE_APPEND_DATA)       result |= FILE_APPEND_DATA;
@@ -90,9 +164,22 @@ static DWORD xbox_share_to_win32(ULONG Share)
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
 {
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path)
+    char xbox_path[MAX_PATH];
+    PXBOX_ANSI_STRING object_name;
+    size_t path_len;
+
+    if (!ObjectAttributes || !(object_name = ObjectAttributes->ObjectName) ||
+        !object_name->Buffer)
         return FALSE;
+
+    /* ANSI_STRING is counted and is not required to be null-terminated.  The
+     * Xbox CRT's stat implementation deliberately shortens Length to open a
+     * parent directory while Buffer still contains the complete filename. */
+    path_len = object_name->Length;
+    if (path_len >= sizeof(xbox_path))
+        return FALSE;
+    memcpy(xbox_path, object_name->Buffer, path_len);
+    xbox_path[path_len] = '\0';
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
@@ -105,6 +192,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    DWORD create_error = ERROR_SUCCESS;
+    ULONG create_information = 1; /* FILE_OPENED */
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -116,23 +205,79 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+        /* Several retail Xbox titles open "directory\\*.*" with
+         * FILE_DIRECTORY_FILE and then enumerate the returned handle. Win32
+         * CreateFile rejects a wildcard component (ERROR_INVALID_NAME), while
+         * the Xbox object manager resolves this to the containing directory.
+         * NtQueryDirectoryFile supplies the actual search pattern later, so
+         * open the directory itself here. */
+        WCHAR *leaf = wcsrchr(win_path, L'\\');
+        if (!leaf) leaf = wcsrchr(win_path, L'/');
+        if (leaf && (wcschr(leaf + 1, L'*') || wcschr(leaf + 1, L'?'))) {
+            *leaf = L'\0';
+        }
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
+        /* XBOX_FILE_NO_INTERMEDIATE_BUFFERING is deliberately not mapped to
+         * FILE_FLAG_NO_BUFFERING: titles use it for DVD streaming (XMV,
+         * audio), and uncached host reads stalled the game thread for
+         * 100-600 ms per 32 KB chunk. Cached reads behave identically. */
+        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) &&
+            GetEnvironmentVariableA("XBOX_FILE_NO_BUFFERING", NULL, 0))
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
+
+        /* Save-container APIs expose paths below U:/T: and Xbox creates the
+         * container before opening SaveMeta.xbx.  Those APIs are part of the
+         * title-side XAPI rather than kernel NtCreateFile, so the host path
+         * layer must materialize the one missing container directory before
+         * a create disposition reaches Win32. */
+        if ((CreateDisposition == XBOX_FILE_CREATE ||
+             CreateDisposition == XBOX_FILE_OPEN_IF ||
+             CreateDisposition == XBOX_FILE_OVERWRITE_IF) &&
+            (wcsstr(win_path, L"\\UserData\\") ||
+             wcsstr(win_path, L"\\TitleData\\"))) {
+            WCHAR parent[MAX_PATH];
+            WCHAR *leaf;
+            wcscpy_s(parent, MAX_PATH, win_path);
+            leaf = wcsrchr(parent, L'\\');
+            if (leaf) {
+                *leaf = L'\0';
+                CreateDirectoryW(parent, NULL);
+            }
+        }
+        SetLastError(ERROR_SUCCESS);
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        create_error = GetLastError();
+        if (h != INVALID_HANDLE_VALUE) {
+            if (CreateDisposition == XBOX_FILE_CREATE ||
+                (CreateDisposition == XBOX_FILE_OPEN_IF &&
+                 create_error != ERROR_ALREADY_EXISTS))
+                create_information = 2; /* FILE_CREATED */
+            else if ((CreateDisposition == XBOX_FILE_SUPERSEDE ||
+                      CreateDisposition == XBOX_FILE_OVERWRITE ||
+                      CreateDisposition == XBOX_FILE_OVERWRITE_IF) &&
+                     create_error == ERROR_ALREADY_EXISTS)
+                create_information = 3; /* FILE_OVERWRITTEN */
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
+        fprintf(stderr,
+                "  [FILE-FAIL] path=%S err=%lu access=%08lX share=%08lX "
+                "disp=%lu options=%08lX attrs=%08lX\n",
+                win_path, (unsigned long)err, (unsigned long)DesiredAccess,
+                (unsigned long)ShareAccess, (unsigned long)CreateDisposition,
+                (unsigned long)CreateOptions, (unsigned long)FileAttributes);
+        fflush(stderr);
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %S (err=%u)", win_path, err);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
@@ -147,10 +292,69 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    /* XCreateSaveGame normally creates SaveMeta.xbx as UTF-16LE metadata.
+     * DAMM's statically linked XAPI reaches the kernel create path, but its
+     * asynchronous metadata write is not yet surfaced by the host scheduler.
+     * Materialize the standard Xbox text record for newly created/empty DAMM
+     * profile containers so the title's own save enumerator can validate and
+     * select them. */
+    {
+    const WCHAR *meta_leaf = wcsrchr(win_path, L'\\');
+    const WCHAR *forward_leaf = wcsrchr(win_path, L'/');
+    if (forward_leaf && (!meta_leaf || forward_leaf > meta_leaf))
+        meta_leaf = forward_leaf;
+    meta_leaf = meta_leaf ? meta_leaf + 1 : win_path;
+    if (_wcsicmp(meta_leaf, L"SaveMeta.xbx") == 0) {
+        LARGE_INTEGER size;
+        size.QuadPart = 0;
+        fprintf(stderr, "[SAVEMETA-HOST] path=%S access=%08lX disp=%lu\n",
+                win_path, (unsigned long)DesiredAccess,
+                (unsigned long)CreateDisposition);
+        if (GetFileSizeEx(h, &size) && size.QuadPart == 0) {
+            const WCHAR *parent_end = wcsrchr(win_path, L'\\');
+            int profile = 1;
+            WCHAR metadata[64];
+            HANDLE metadata_file;
+            DWORD written = 0;
+            if (parent_end && parent_end - win_path >= 2) {
+                WCHAR suffix = parent_end[-1];
+                if (suffix >= L'B' && suffix <= L'E')
+                    profile = (int)(suffix - L'B') + 1;
+            }
+            swprintf_s(metadata, 64, L"\xFEFFName=Godzilla-%d\r\n", profile);
+            /* The XAPI opens metadata read-only after FILE_OPEN_IF created it.
+             * Close that handle briefly so the host can seed the standard
+             * record, then restore an equivalent read handle for the title. */
+            CloseHandle(h);
+            metadata_file = CreateFileW(win_path, GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL, NULL);
+            if (metadata_file != INVALID_HANDLE_VALUE) {
+                WriteFile(metadata_file, metadata,
+                          (DWORD)(wcslen(metadata) * sizeof(WCHAR)),
+                          &written, NULL);
+                CloseHandle(metadata_file);
+                fprintf(stderr, "[SAVEMETA-HOST] wrote=%lu path=%S\n",
+                        (unsigned long)written, win_path);
+            } else {
+                fprintf(stderr, "[SAVEMETA-HOST] write-open-failed=%lu path=%S\n",
+                        (unsigned long)GetLastError(), win_path);
+            }
+            h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
+                xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
+                flags_and_attrs, NULL);
+            if (h == INVALID_HANDLE_VALUE)
+                return STATUS_UNSUCCESSFUL;
+        }
+    }
+    }
+
+    readahead_file(h, win_path, xbox_access_to_win32(DesiredAccess));
     *FileHandle = h;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
+        IoStatusBlock->Information = create_information;
     }
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %S -> handle=%p", win_path, h);
     return STATUS_SUCCESS;
@@ -164,11 +368,13 @@ NTSTATUS __stdcall xbox_NtReadFile(
     DWORD bytes_read = 0;
     BOOL result;
     OVERLAPPED ov;
+    LARGE_INTEGER io_start;
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    QueryPerformanceCounter(&io_start);
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
@@ -176,6 +382,27 @@ NTSTATUS __stdcall xbox_NtReadFile(
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, &ov);
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
+    }
+    {
+        /* XBOX_IOSTAT=1: per-second read count/bytes/time (load stalls) */
+        static int on = -1; static LONGLONG acc, last, freq, t0; static unsigned n, big; static unsigned long long bytes;
+        LARGE_INTEGER now;
+        if (on < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; on = GetEnvironmentVariableA("XBOX_IOSTAT", NULL, 0) > 0; }
+        if (on) {
+            QueryPerformanceCounter(&now);
+            if (!last) last = now.QuadPart;
+            n++; bytes += bytes_read;
+            if (big++ < 400)
+                fprintf(stderr, "[IOSTAT] read len=%lu got=%lu off=%lld handle=%p dur=%.2fms gap=%.2fms\n", (unsigned long)Length,
+                        (unsigned long)bytes_read, ByteOffset ? (long long)ByteOffset->QuadPart : -1LL, FileHandle, (now.QuadPart - io_start.QuadPart) * 1000.0 / freq,
+                        t0 ? (now.QuadPart - t0) * 1000.0 / freq : 0.0);
+            t0 = now.QuadPart;
+            if (now.QuadPart - last > freq) {
+                fprintf(stderr, "[IOSTAT] reads=%u bytes=%llu\n", n, bytes);
+                n = 0; bytes = 0; last = now.QuadPart;
+            }
+            (void)acc;
+        }
     }
 
     if (result || GetLastError() == ERROR_HANDLE_EOF) {
@@ -232,10 +459,16 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_UNSUCCESSFUL;
 }
 
+/* Directory searches are keyed by the native file handle.  Win32 can reuse a
+ * handle value immediately after CloseHandle, so leaving a search context
+ * behind makes a later, unrelated directory query resume the old search. */
+static void release_dir_context(HANDLE FileHandle);
+
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        release_dir_context(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -541,6 +774,23 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     return NULL;
 }
 
+static void release_dir_context(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        DIR_CONTEXT* ctx = &s_dir_contexts[i];
+        if (ctx->file_handle != FileHandle)
+            continue;
+        if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE)
+            FindClose(ctx->find_handle);
+        memset(ctx, 0, sizeof(*ctx));
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -573,17 +823,24 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        if (FileName && FileName->Buffer && FileName->Length > 0) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
             pattern_wide[FileName->Length] = L'\0';
             swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
         } else {
+            /* XDK directory helpers commonly pass an allocated ANSI_STRING
+             * whose Length is zero for the initial unfiltered scan.  A
+             * non-null empty string is not a literal empty Win32 pattern;
+             * it has the same meaning as a null FileName here. */
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
+            fprintf(stderr, "  [QDIR-FAIL] search=\"%S\" err=%lu\n",
+                    search_path, (unsigned long)GetLastError());
+            fflush(stderr);
             ctx->find_handle = NULL;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;

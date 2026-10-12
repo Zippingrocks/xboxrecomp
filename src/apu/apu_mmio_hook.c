@@ -20,6 +20,9 @@ MCPXAPUState *g_apu_state = NULL;
 #if defined(_WIN32)
 #include <windows.h>
 
+typedef uint64_t (*xbox_mmio_read_fn)(void *op, uint32_t off, unsigned size);
+typedef void (*xbox_mmio_write_fn)(void *op, uint32_t off, uint64_t val, unsigned size);
+
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
 #define APU_MMIO_SIZE  0x00080000u  /* 512KB */
@@ -77,10 +80,13 @@ static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
  * Instruction decoder for APU MMIO access
  * ============================================================ */
 
-static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+/* Generic decoder: emulates the faulting host instruction against a device
+ * model given by read/write callbacks (used for the APU and the NIC). */
+bool xbox_mmio_emulate(PCONTEXT ctx, uint32_t mmio_offset, int is_write,
+                       xbox_mmio_read_fn rd, xbox_mmio_write_fn wr, void *op)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
-    if (!g_apu_state) return false;
+    (void)is_write;
 
     int prefix_len = 0;
     int has_66 = 0;
@@ -109,7 +115,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
         uint64_t val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, val, access_size);
+        wr(op, mmio_offset, val, access_size);
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
         return true;
@@ -119,7 +125,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
     if (opcode[0] == 0xC7) {
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         uint32_t imm = *(uint32_t *)(opcode + 1 + modrm_len);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, imm, access_size);
+        wr(op, mmio_offset, imm, access_size);
         ctx->Rip += prefix_len + 1 + modrm_len + 4;
         g_apu_mmio_write_count++;
         return true;
@@ -130,7 +136,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         access_size = 1;
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         uint8_t imm = *(opcode + 1 + modrm_len);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, imm, 1);
+        wr(op, mmio_offset, imm, 1);
         ctx->Rip += prefix_len + 1 + modrm_len + 1;
         g_apu_mmio_write_count++;
         return true;
@@ -141,7 +147,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         if (opcode[0] == 0x8A) access_size = 1;
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
+        uint64_t val = rd(op, mmio_offset, access_size);
         uint64_t *dst = ctx_reg64(ctx, reg);
         if (access_size == 1) *dst = (*dst & ~0xFFULL) | (val & 0xFF);
         else if (access_size == 2) *dst = (*dst & ~0xFFFFULL) | (val & 0xFFFF);
@@ -157,7 +163,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         access_size = 1;
         int modrm_len = decode_modrm_len(opcode + 2, rex_b);
         int reg = ((opcode[2] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, 1);
+        uint64_t val = rd(op, mmio_offset, 1);
         *ctx_reg64(ctx, reg) = val & 0xFF;
         ctx->Rip += prefix_len + 2 + modrm_len;
         g_apu_mmio_read_count++;
@@ -169,7 +175,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         access_size = 2;
         int modrm_len = decode_modrm_len(opcode + 2, rex_b);
         int reg = ((opcode[2] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, 2);
+        uint64_t val = rd(op, mmio_offset, 2);
         *ctx_reg64(ctx, reg) = val & 0xFFFF;
         ctx->Rip += prefix_len + 2 + modrm_len;
         g_apu_mmio_read_count++;
@@ -181,7 +187,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         if (opcode[0] == 0x84) access_size = 1;
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
+        uint64_t mem_val = rd(op, mmio_offset, access_size);
         uint64_t reg_val = *ctx_reg64(ctx, reg);
         uint64_t result = mem_val & reg_val;
         ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
@@ -197,7 +203,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         if (opcode[0] == 0x38) access_size = 1;
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
+        uint64_t mem_val = rd(op, mmio_offset, access_size);
         uint64_t reg_val = *ctx_reg64(ctx, reg);
         if (access_size <= 4) {
             mem_val &= (1ULL << (access_size * 8)) - 1;
@@ -218,9 +224,9 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         if (opcode[0] == 0x08) access_size = 1;
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
+        uint64_t mem_val = rd(op, mmio_offset, access_size);
         uint64_t reg_val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, mem_val | reg_val, access_size);
+        wr(op, mmio_offset, mem_val | reg_val, access_size);
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
         return true;
@@ -231,9 +237,9 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         if (opcode[0] == 0x20) access_size = 1;
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
+        uint64_t mem_val = rd(op, mmio_offset, access_size);
         uint64_t reg_val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, mem_val & reg_val, access_size);
+        wr(op, mmio_offset, mem_val & reg_val, access_size);
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
         return true;
@@ -242,11 +248,21 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
     /* Unrecognized */
     g_apu_mmio_decode_fail++;
     if (g_apu_mmio_decode_fail <= 20) {
-        fprintf(stderr, "[APU] MMIO decode fail at RIP=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
+        fprintf(stderr, "[MMIO] decode fail at RIP=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
                 (void*)ctx->Rip, mmio_offset, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
         fflush(stderr);
     }
     return false;
+}
+
+
+static uint64_t apu_rd(void *op, uint32_t off, unsigned size) { return mcpx_apu_mmio_read((MCPXAPUState *)op, off, size); }
+static void apu_wr(void *op, uint32_t off, uint64_t val, unsigned size) { mcpx_apu_mmio_write((MCPXAPUState *)op, off, val, size); }
+
+static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+{
+    if (!g_apu_state) return false;
+    return xbox_mmio_emulate(ctx, mmio_offset, is_write, apu_rd, apu_wr, g_apu_state);
 }
 
 /* ============================================================
@@ -258,6 +274,13 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
     return apu_decode_and_handle(ctx, mmio_offset, is_write);
+}
+
+void apu_hook_get_stats(int *reads, int *writes, int *decode_fail)
+{
+    if (reads) *reads = g_apu_mmio_read_count;
+    if (writes) *writes = g_apu_mmio_write_count;
+    if (decode_fail) *decode_fail = g_apu_mmio_decode_fail;
 }
 
 #endif /* _WIN32 */

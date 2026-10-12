@@ -960,8 +960,12 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
 
         int count = voice_get_samples(d, v, &samples[sample_count],
                                       requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
+        /* -1: paused, or a persistent stream waiting for its next SSL.
+         * Report that as "no progress" so the caller stops asking this
+         * frame; returning 0 here spun voice_process forever and froze the
+         * APU (XMV movie audio starving between packets). */
+        if (count < 0) return sample_count ? sample_count : -1;
+        if (count == 0) return sample_count ? sample_count : -1;
         sample_count += count;
     }
     (void)rate; /* Ignored until we add proper resampling */
@@ -1044,7 +1048,7 @@ static void voice_process(MCPXAPUState *d,
             if (!active) return;
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
-            if (count < 0) break;
+            if (count <= 0) break;
             sample_count += count;
         }
     }
@@ -1169,9 +1173,15 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+int g_vp_dbg_listed, g_vp_dbg_active;
+/* Status-thread request: describe the voices on the next frame. */
+volatile int g_vp_dbg_want;
+char g_vp_dbg_desc[1024];
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    int listed = 0, active = 0;
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1189,6 +1199,20 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             }
 
             uint16_t v = (uint16_t)d->regs[current];
+            listed++;
+            if (g_vp_dbg_want && listed <= 8) {
+                size_t n = strlen(g_vp_dbg_desc);
+                snprintf(g_vp_dbg_desc + n, sizeof(g_vp_dbg_desc) - n,
+                         " v%u[l%d %s%s%s st=%08X ssl=%d/%d cnt=%u,%u cbo=%u]",
+                         v, list,
+                         voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) ? "S" : "B",
+                         voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_PERSIST) ? "P" : "",
+                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED) ? "z" : "",
+                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu),
+                         d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg,
+                         d->vp.ssl[v].count[0], d->vp.ssl[v].count[1],
+                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO));
+            }
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
@@ -1197,11 +1221,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
+                active++;
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
             d->regs[current] = d->regs[next];
         }
     }
+
+    g_vp_dbg_listed = listed;
+    g_vp_dbg_active = active;
+    if (g_vp_dbg_want) g_vp_dbg_want = 0;
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

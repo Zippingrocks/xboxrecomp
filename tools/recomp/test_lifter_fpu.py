@@ -45,7 +45,7 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(store),
-            ["SMEM64(esp + 0x10) = (int64_t)llrint(fp_top()); "
+            ["SMEM64(esp + 0x10) = (int64_t)recomp_x87_round(fp_top()); "
              "fp_pop(); /* fistp */"],
         )
         self.assertEqual(

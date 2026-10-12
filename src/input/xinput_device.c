@@ -11,6 +11,8 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ======================================================================== */
@@ -24,6 +26,111 @@
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
+static void apply_keyboard_menu_controls(XBOX_INPUT_STATE *pState,
+                                        int keyboard_enabled)
+{
+    static ULONGLONG auto_start_epoch;
+    DWORD fg_pid = 0;
+
+    /* GetAsyncKeyState is system-wide: only honour the keyboard while this
+     * process owns the foreground window, so typing elsewhere (or a test run
+     * in the background) never presses buttons in the game. */
+    GetWindowThreadProcessId(GetForegroundWindow(), &fg_pid);
+    if (!keyboard_enabled || fg_pid != GetCurrentProcessId())
+        goto auto_start;
+
+    if (GetAsyncKeyState(VK_RETURN) & 0x8000)
+        pState->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+    if (GetAsyncKeyState(VK_UP) & 0x8000)
+        pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_UP;
+    if (GetAsyncKeyState(VK_DOWN) & 0x8000)
+        pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (GetAsyncKeyState(VK_LEFT) & 0x8000)
+        pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (GetAsyncKeyState(VK_RIGHT) & 0x8000)
+        pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if ((GetAsyncKeyState(VK_SPACE) & 0x8000) ||
+        (GetAsyncKeyState('Z') & 0x8000))
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+    if (GetAsyncKeyState('X') & 0x8000)
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+
+auto_start:
+    /* Deterministic headless test aid.  This is disabled in normal runs and
+     * periodically taps Start only when explicitly requested by the launcher. */
+    /* GODZILLA_AUTO_START[=delay_seconds]: after the delay (default 0),
+     * tap Start for 750 ms every 5 s. */
+    if (getenv("GODZILLA_AUTO_START")) {
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG delay = (ULONGLONG)atoi(getenv("GODZILLA_AUTO_START")) * 1000ull;
+        if (!auto_start_epoch)
+            auto_start_epoch = now;
+        /* GODZILLA_AUTO_START_TAPS=n limits the number of taps */
+        ULONGLONG taps = getenv("GODZILLA_AUTO_START_TAPS")
+            ? (ULONGLONG)atoi(getenv("GODZILLA_AUTO_START_TAPS")) : ~0ull;
+        if (now - auto_start_epoch >= delay &&
+            (now - auto_start_epoch - delay) / 5000 < taps &&
+            ((now - auto_start_epoch - delay) % 5000) < 750)
+            pState->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+    }
+    /* GODZILLA_INPUT_SCRIPT="secs:button,secs:button,...": tap a button for
+     * 300 ms at each time (seconds since first poll, fractional allowed).
+     * Buttons: start back a b x y up down left right. */
+    if (getenv("GODZILLA_INPUT_SCRIPT")) {
+        static ULONGLONG script_epoch;
+        ULONGLONG now = GetTickCount64();
+        const char *p = getenv("GODZILLA_INPUT_SCRIPT");
+        if (!script_epoch) script_epoch = now;
+        while (*p) {
+            char name[16];
+            int k = 0;
+            double t = strtod(p, (char **)&p);
+            ULONGLONG at;
+            if (*p == ':') p++;
+            while (*p && *p != ',' && k < 15) name[k++] = *p++;
+            name[k] = 0;
+            if (*p == ',') p++;
+            at = script_epoch + (ULONGLONG)(t * 1000.0);
+            if (now >= at && now < at + 300) {
+                if (!strcmp(name, "start")) pState->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+                else if (!strcmp(name, "back")) pState->Gamepad.wButtons |= XBOX_GAMEPAD_BACK;
+                else if (!strcmp(name, "up")) pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_UP;
+                else if (!strcmp(name, "down")) pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_DOWN;
+                else if (!strcmp(name, "left")) pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_LEFT;
+                else if (!strcmp(name, "right")) pState->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_RIGHT;
+                else if (!strcmp(name, "a")) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+                else if (!strcmp(name, "b")) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+                else if (!strcmp(name, "x")) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] = 255;
+                else if (!strcmp(name, "y")) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = 255;
+            }
+            if (!k) break;
+        }
+    }
+}
+
+static void trace_menu_input(const XBOX_INPUT_STATE *pState)
+{
+    static WORD last_buttons;
+    static BYTE last_analog[8];
+    const XBOX_GAMEPAD *pad = &pState->Gamepad;
+
+    if (!getenv("GODZILLA_INPUT_TRACE"))
+        return;
+    if (pad->wButtons == last_buttons &&
+        memcmp(pad->bAnalogButtons, last_analog, sizeof(last_analog)) == 0)
+        return;
+
+    fprintf(stderr,
+        "[INPUT] packet=%lu digital=%04X analog=A:%u B:%u X:%u Y:%u\n",
+        (unsigned long)pState->dwPacketNumber, pad->wButtons,
+        pad->bAnalogButtons[XBOX_BUTTON_A],
+        pad->bAnalogButtons[XBOX_BUTTON_B],
+        pad->bAnalogButtons[XBOX_BUTTON_X],
+        pad->bAnalogButtons[XBOX_BUTTON_Y]);
+    last_buttons = pad->wButtons;
+    memcpy(last_analog, pad->bAnalogButtons, sizeof(last_analog));
+}
+
 void xbox_InputInit(void)
 {
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -33,7 +140,8 @@ void xbox_InputInit(void)
     }
 }
 
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState,
+                             int keyboard_enabled)
 {
     XINPUT_STATE xi_state;
     DWORD result;
@@ -41,10 +149,32 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    /* Test-only deterministic replay mode.  It deliberately ignores the host
+     * controller so a scripted callback test cannot be contaminated by stick
+     * drift or buttons pressed in the visible game window. */
+    if (dwPort == 0 && getenv("GODZILLA_INPUT_SCRIPT_ONLY")) {
+        memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+        pState->dwPacketNumber = ++g_last_packet[dwPort];
+        apply_keyboard_menu_controls(pState, keyboard_enabled);
+        trace_menu_input(pState);
+        g_controller_connected[dwPort] = TRUE;
+        return ERROR_SUCCESS;
+    }
+
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
-        g_controller_connected[dwPort] = FALSE;
-        return result;
+        /* Keep port 0 usable on keyboard-only hosts.  Save the Earth's shell
+         * waits at controller selection when no pad is present, so expose a
+         * neutral virtual pad and map the minimum menu controls. */
+        if (dwPort != 0)
+            return result;
+
+        memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+        pState->dwPacketNumber = ++g_last_packet[dwPort];
+        apply_keyboard_menu_controls(pState, keyboard_enabled);
+        trace_menu_input(pState);
+        g_controller_connected[dwPort] = TRUE;
+        return ERROR_SUCCESS;
     }
 
     g_controller_connected[dwPort] = TRUE;
@@ -73,8 +203,20 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    apply_keyboard_menu_controls(pState, keyboard_enabled);
+    trace_menu_input(pState);
 
     return ERROR_SUCCESS;
+}
+
+DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    return input_get_state(dwPort, pState, 1);
+}
+
+DWORD xbox_InputGetStateRaw(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    return input_get_state(dwPort, pState, 0);
 }
 
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
@@ -92,6 +234,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    if (dwPort == 0) return TRUE;
     return g_controller_connected[dwPort];
 }
 
@@ -104,7 +247,11 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
         return ERROR_DEVICE_NOT_CONNECTED;
 
     result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
-    if (result != ERROR_SUCCESS) return result;
+    if (result != ERROR_SUCCESS) {
+        if (dwPort != 0) return result;
+        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+        return ERROR_SUCCESS;
+    }
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
     pCaps->Type = xi_caps.Type;
@@ -119,6 +266,12 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+
+/* The SDL backend currently has no keyboard overlay. */
+DWORD xbox_InputGetStateRaw(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    return xbox_InputGetState(dwPort, pState);
+}
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];

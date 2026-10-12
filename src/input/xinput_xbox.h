@@ -95,6 +95,13 @@ void xbox_InputInit(void);
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
 /**
+ * Get controller/test-script state without the runtime keyboard overlay.
+ * A title with its own keyboard mapping must use this entry point so each
+ * host key is translated once. The ordinary API keeps its existing mapping.
+ */
+DWORD xbox_InputGetStateRaw(DWORD dwPort, XBOX_INPUT_STATE *pState);
+
+/**
  * Set controller vibration.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);

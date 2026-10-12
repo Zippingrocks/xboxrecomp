@@ -21,7 +21,8 @@ import struct
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
-from .lifter import Lifter, lift_basic_block, detect_seh_helpers
+from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                     _first_flag_consumer, _consumer_condition)
 
 
 def _fixup_icall_esp_save(lines):
@@ -688,18 +689,12 @@ class FunctionTranslator:
         self.lifter.needs_cf = has_carry
         self.lifter.publishes_ebp = self._func_has_prologue(instructions)
 
-        # SSE/MMX register declarations
-        if used_xmm:
-            xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
-            mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
-                               and not r.startswith("xmm")])
-            # XMM is architectural state and is declared globally by the
-            # runtime, exactly like the GPRs and the x87 stack. Declaring it
-            # here would shadow that global with a fresh zeroed local, so a
-            # value produced in one block and read in the next - a return
-            # value in xmm0, or a spill straddling a branch - would be lost.
-            if mmx_regs:
-                lines.append(f"    uint64_t {', '.join(mmx_regs)};")
+        # XMM and MMX registers are architectural state and are declared
+        # globally by the runtime, exactly like the GPRs and the x87 stack.
+        # Declaring them here would shadow the global with a fresh local, so
+        # a value produced in one function and read in another - the WMV
+        # decoder loads its MMX constants once and calls helpers that use
+        # them - would be lost.
 
         # The x87 stack is architectural state and survives guest calls. Some
         # detector boundaries also split one original CRT helper into several
@@ -713,7 +708,12 @@ class FunctionTranslator:
         # ebp is a local variable that would start uninitialized, causing
         # crashes when the function reads MEM32(ebp + offset). The g_seh_ebp
         # global bridges ebp across function boundaries.
-        if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
+        # Only when nothing above already inherited the frame through g_ebp:
+        # callers publish g_ebp before every direct call and tail jumps now
+        # publish it too, while g_seh_ebp can be stale for a direct call
+        # (CRT x87 helper 0x1A74D3 read its caller's locals through it).
+        if (frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue
+                and not any("ebp = g_ebp;" in l for l in lines)):
             lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
 
         lines.append(f"")
@@ -754,8 +754,56 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        def incoming_state(bb, out_state):
+            # Inherit the flag state only when every predecessor agrees on it.
+            # A predecessor not computed yet is unknown, which costs a
+            # fallback condition and never a wrong one.
+            sources = preds[bb.start]
+            if bb.start == start or not sources:
+                return None
+            if not all(p in out_state for p in sources):
+                return None
+            states = [out_state[p] for p in sources]
+            incoming = states[0]
+            for other in states[1:]:
+                if other != incoming:
+                    return None
+            return incoming
+
+        # Blocks are walked in address order, so on the first walk a back
+        # edge's predecessor has no state yet. Walk once to learn every
+        # block's outgoing state, then lift for real with all of them known.
         out_state = {}
         for bb in blocks:
+            _, out_state[bb.start] = lift_basic_block(
+                self.lifter, bb, flag_state=incoming_state(bb, out_state))
+
+        # A block whose first flag consumer runs before any flag setter, and
+        # whose predecessors leave different flags, cannot be given one
+        # condition. Each predecessor evaluates the consumer's condition into
+        # _flags before transferring control; the consumer, lifted with no
+        # incoming state, reads _flags. (Loops such as `sub; L: je out; ...;
+        # dec; jmp L` otherwise test an _flags nothing ever set.)
+        materialize = {}
+        for bb in blocks:
+            if bb.start == start or incoming_state(bb, out_state) is not None:
+                continue
+            consumer = _first_flag_consumer(bb)
+            if consumer is None:
+                continue
+            exprs = {}
+            for p in preds[bb.start]:
+                st = out_state.get(p)
+                cond = _consumer_condition(consumer, st) if st else None
+                if cond is None:
+                    exprs = None
+                    break
+                exprs[p] = cond
+            if exprs:
+                materialize[bb.start] = exprs
+
+        final_state = {}
+        for idx, bb in enumerate(blocks):
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
                 # The trailing ';' is load-bearing: C requires a statement after
@@ -765,25 +813,27 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
-            else:
-                incoming = None
-
-            stmts, out_state[bb.start] = lift_basic_block(
+            incoming = incoming_state(bb, out_state)
+            stmts, final_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+
+            last = bb.instructions[-1] if bb.instructions else None
+            target = last.jump_target if last is not None else None
+            if target in materialize and bb.start in materialize[target]:
+                assign = f"_flags = ({materialize[target][bb.start]});"
+                goto = f"goto loc_{target:08X};"
+                for k in range(len(stmts) - 1, -1, -1):
+                    if goto in stmts[k]:
+                        stmts[k] = stmts[k].replace(
+                            goto, f"{{ {assign} {goto} }}", 1)
+                        break
+            nxt = blocks[idx + 1].start if idx + 1 < len(blocks) else None
+            falls = last is not None and not (
+                last.is_ret or last.mnemonic in ("jmp", "int3", "ud2", "hlt"))
+            if falls and nxt in materialize and bb.start in materialize[nxt]:
+                stmts.append(f"_flags = ({materialize[nxt][bb.start]});"
+                             f" /* flags for loc_{nxt:08X} */")
+
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
@@ -792,7 +842,7 @@ class FunctionTranslator:
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
             ft_name = self.lifter._call_target_name(fallthrough_target)
-            lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
+            lines.append(f"    g_seh_ebp = ebp; g_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
 

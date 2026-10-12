@@ -74,19 +74,19 @@ static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
 
 #define NV097_SET_BEGIN_END             0x17FC
 #define NV097_INLINE_ARRAY              0x1818
-#define NV097_CLEAR_SURFACE             0x01D0
-#define NV097_SET_COLOR_CLEAR_VALUE     0x01D4
-#define NV097_SET_CLEAR_RECT_HORIZONTAL 0x01D8
-#define NV097_SET_CLEAR_RECT_VERTICAL   0x01DC
+#define NV097_CLEAR_SURFACE             0x1D94
+#define NV097_SET_COLOR_CLEAR_VALUE     0x1D90
+#define NV097_SET_CLEAR_RECT_HORIZONTAL 0x1D98
+#define NV097_SET_CLEAR_RECT_VERTICAL   0x1D9C
 
-#define NV097_SET_DEPTH_TEST_ENABLE     0x0354
+#define NV097_SET_DEPTH_TEST_ENABLE     0x030C
 #define NV097_SET_BLEND_ENABLE          0x0304
 #define NV097_SET_BLEND_FUNC_SFACTOR    0x0344
 #define NV097_SET_BLEND_FUNC_DFACTOR    0x0348
-#define NV097_SET_CULL_FACE_ENABLE      0x039C
+#define NV097_SET_CULL_FACE_ENABLE      0x0308
 #define NV097_SET_ALPHA_TEST_ENABLE     0x0300
 #define NV097_SET_COLOR_MASK            0x0358
-#define NV097_SET_SHADE_MODE            0x0368
+#define NV097_SET_SHADE_MODE            0x037C
 
 #define NV097_SET_VIEWPORT_OFFSET       0x0A20
 #define NV097_SET_VIEWPORT_SCALE        0x0AF0
@@ -95,7 +95,10 @@ static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
 
 #define NV097_SET_TEXTURE_OFFSET        0x1B00  /* +0x40 per stage */
 #define NV097_SET_TEXTURE_FORMAT        0x1B04  /* +0x40 per stage */
-#define NV097_SET_TEXTURE_CONTROL0      0x1B08  /* +0x40 per stage */
+#define NV097_SET_TEXTURE_CONTROL0      0x1B0C  /* +0x40 per stage */
+#define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760 /* +4 per attribute */
+#define NV097_SET_VERTEX_DATA4UB        0x1940  /* +4 per attribute */
+#define NV2A_ATTR_DIFFUSE               3
 
 /* NV2A draw modes → D3D primitive types */
 static int nv2a_draw_mode_to_d3d(uint32_t mode) {
@@ -129,7 +132,7 @@ static uint32_t nv2a_blend_to_d3d(uint32_t nv) {
 
 /* Inline vertex buffer - max 16K vertices per draw */
 #define MAX_INLINE_VERTS 16384
-#define INLINE_VERT_DWORDS 5  /* X, Y, U, V, Color */
+#define INLINE_VERT_DWORDS 16
 
 /* RwIm2DVertex-compatible output vertex (28 bytes) */
 typedef struct {
@@ -148,6 +151,8 @@ static struct {
     uint32_t inline_data[MAX_INLINE_VERTS * INLINE_VERT_DWORDS];
     uint32_t inline_count; /* Number of dwords accumulated */
     uint32_t vert_stride;  /* Dwords per vertex (auto-detected) */
+    uint32_t vertex_format[16];
+    uint32_t attr_constant[16];  /* SET_VERTEX_DATA4UB values (disabled attributes) */
 
     /* Clear state */
     uint32_t clear_color;
@@ -173,7 +178,7 @@ static struct {
     struct {
         uint32_t offset;     /* NV2A VRAM offset (method 0x1B00) */
         uint32_t format;     /* Format register (method 0x1B04) */
-        uint32_t control0;   /* Control0 register (method 0x1B08) */
+        uint32_t control0;   /* Control0 register (method 0x1B0C) */
         int enabled;         /* Decoded from control0 bit 30 */
     } tex[4];
 
@@ -208,9 +213,10 @@ static float u2f(uint32_t u) {
 void pgraph_d3d11_init(void)
 {
     memset(&g_pg, 0, sizeof(g_pg));
-    g_pg.vert_stride = INLINE_VERT_DWORDS;  /* Default: 5 dwords per vertex */
+    g_pg.vert_stride = 5;  /* Legacy menu-capture default until formats arrive */
     g_pg.clear_color = 0xFF000000;
     g_pg.color_mask = 0x01010101;
+    g_pg.attr_constant[NV2A_ATTR_DIFFUSE] = 0xFFFFFFFFu;
     g_pg.initialized = 1;
 
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
@@ -235,6 +241,15 @@ static void submit_draw(void)
     uint32_t num_verts = g_pg.inline_count / g_pg.vert_stride;
     if (num_verts < 3)
         return;
+
+    /* All four channel write enables clear: the draw only touches depth or
+     * stencil, which this translator does not model. */
+    if ((g_pg.color_mask & 0x01010101u) == 0)
+        return;
+
+    /* Position-only layouts take diffuse from the attribute's constant
+     * register (SET_VERTEX_DATA4UB) rather than from the vertex. */
+    uint32_t const_diffuse = g_pg.attr_constant[NV2A_ATTR_DIFFUSE];
 
     const uint32_t *src = g_pg.inline_data;
     int actual_prim_type = g_pg.d3d_prim_type;
@@ -271,9 +286,9 @@ static void submit_draw(void)
         out[dst_idx].y     = u2f(src[_b + 1]); \
         out[dst_idx].z     = 0.0f; \
         out[dst_idx].rhw   = 1.0f; \
-        out[dst_idx].u     = u2f(src[_b + 2]); \
-        out[dst_idx].v     = u2f(src[_b + 3]); \
-        out[dst_idx].color = src[_b + 4]; \
+        out[dst_idx].u     = g_pg.vert_stride >= 5 ? u2f(src[_b + 2]) : 0.0f; \
+        out[dst_idx].v     = g_pg.vert_stride >= 5 ? u2f(src[_b + 3]) : 0.0f; \
+        out[dst_idx].color = g_pg.vert_stride >= 5 ? src[_b + 4] : const_diffuse; \
     } while(0)
 
     if (is_quads) {
@@ -330,14 +345,23 @@ static void submit_draw(void)
     }
 
     /* Log first few draws' vertex positions (once) */
-    if (g_pg.stats.draw_calls < 3 && num_verts >= 3) {
-        fprintf(stderr, "[PGRAPH-D3D11] Draw verts (mode=%u, %u in → %u out):\n",
-                g_pg.draw_mode, num_verts, out_vert_count);
-        uint32_t show = num_verts < 8 ? num_verts : 8;
+    if (g_pg.stats.draw_calls < 6 && num_verts >= 3) {
+        fprintf(stderr, "[PGRAPH-D3D11] Draw verts (mode=%u, stride=%u, inline=%u, %u in → %u out, tex=%08X fmt=%08X ctl=%08X enabled=%d):\n",
+                g_pg.draw_mode, g_pg.vert_stride, g_pg.inline_count,
+                num_verts, out_vert_count, g_pg.tex[0].offset,
+                g_pg.tex[0].format, g_pg.tex[0].control0,
+                g_pg.tex[0].enabled);
+        fprintf(stderr, "  formats:");
+        for (uint32_t i = 0; i < 16; ++i)
+            fprintf(stderr, " %08X", g_pg.vertex_format[i]);
+        fprintf(stderr, "\n  raw:");
+        for (uint32_t i = 0; i < g_pg.inline_count && i < 32; ++i)
+            fprintf(stderr, " %08X", src[i]);
+        fprintf(stderr, "\n");
+        uint32_t show = out_vert_count < 8 ? out_vert_count : 8;
         for (uint32_t i = 0; i < show; i++) {
-            uint32_t b = i * g_pg.vert_stride;
             fprintf(stderr, "  [%u] pos=(%.1f, %.1f) uv=(%.3f, %.3f) color=0x%08X\n",
-                    i, u2f(src[b+0]), u2f(src[b+1]), u2f(src[b+2]), u2f(src[b+3]), src[b+4]);
+                    i, out[i].x, out[i].y, out[i].u, out[i].v, out[i].color);
         }
     }
 
@@ -416,9 +440,9 @@ static void submit_draw(void)
             /* No texture — use vertex color only */
             dev->lpVtbl->SetTexture(dev, 0, NULL);
             dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*COLOROP*/, 2 /*SELECTARG1*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*COLORARG1*/, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*COLORARG1*/, 1 /*CURRENT*/);
             dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*ALPHAOP*/, 2 /*SELECTARG1*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*ALPHAARG1*/, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*ALPHAARG1*/, 1 /*CURRENT*/);
         }
     } else {
         dev->lpVtbl->SetTexture(dev, 0, NULL);
@@ -428,9 +452,9 @@ static void submit_draw(void)
     {
         dev->lpVtbl->SetTexture(dev, 0, NULL);
         dev->lpVtbl->SetTextureStageState(dev, 0, 1, 2 /*SELECTARG1*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 2, 0 /*DIFFUSE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 2, 1 /*CURRENT*/);
         dev->lpVtbl->SetTextureStageState(dev, 0, 4, 2 /*SELECTARG1*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 5, 0 /*DIFFUSE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 5, 1 /*CURRENT*/);
     }
 #endif
 
@@ -438,7 +462,7 @@ static void submit_draw(void)
     dev->lpVtbl->BeginScene(dev);
 
     /* Draw */
-    dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)g_pg.d3d_prim_type,
+    dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)actual_prim_type,
                                   prim_count, out, sizeof(OutputVertex));
 
     g_pg.stats.draw_calls++;
@@ -460,6 +484,36 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         return 0;
 
     g_pg.stats.methods_handled++;
+
+    if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT &&
+        method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 16u * 4u) {
+        uint32_t attribute = (method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4u;
+        uint32_t stride = 0;
+
+        g_pg.vertex_format[attribute] = param;
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint32_t format = g_pg.vertex_format[i];
+            uint32_t type = format & 0xFu;
+            uint32_t size = (format >> 4) & 0xFu;
+            if (!size)
+                continue;
+            if (type == 2u)
+                stride += size;              /* IEEE float */
+            else if (type == 1u || type == 5u)
+                stride += (size + 1u) / 2u; /* packed 16-bit */
+            else
+                stride += 1u;               /* packed color/CMP */
+        }
+        if (stride > 0 && stride <= INLINE_VERT_DWORDS)
+            g_pg.vert_stride = stride;
+        return 1;
+    }
+
+    if (method >= NV097_SET_VERTEX_DATA4UB &&
+        method < NV097_SET_VERTEX_DATA4UB + 16u * 4u) {
+        g_pg.attr_constant[(method - NV097_SET_VERTEX_DATA4UB) / 4u] = param;
+        return 1;
+    }
 
     switch (method) {
 

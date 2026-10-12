@@ -125,6 +125,9 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* EFLAGS.DF (set by std, cleared by cld). The CRT's strrchr and backward
+ * memmove run their string instructions with it set. */
+extern RECOMP_TLS int g_df;
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
@@ -147,6 +150,21 @@ extern RECOMP_TLS uint32_t g_ebp;
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
+
+/* Round to an integer the way the x87 does: by the control word's RC field
+ * (bits 10-11), not the host's rounding mode. The CRT's floor/ceil set RC
+ * with fldcw and then frndint/fistp; rounding to nearest regardless made
+ * floor(0.8) == 1 (Godzilla's particle sine-table lookup then indexed off
+ * the table and spawned particles at 1e18). */
+static inline double recomp_x87_round(double v)
+{
+    switch ((g_fp_control_word >> 10) & 3u) {
+    case 1: return floor(v);
+    case 2: return ceil(v);
+    case 3: return trunc(v);
+    default: return nearbyint(v);   /* host default: nearest even */
+    }
+}
 extern RECOMP_TLS int g_fp_cmp;
 
 /* Result of an x87 compare, in the shape the status word wants:
@@ -231,6 +249,7 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
 #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
+#define MEM64(addr)  (*(volatile uint64_t *)XBOX_PTR(addr))
 
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
@@ -268,6 +287,74 @@ typedef union RecompXmm {
 
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+
+/* MMX registers. Architectural state that survives guest calls, like the
+ * GPRs and XMM registers, so these are per-thread globals, not locals. */
+extern RECOMP_TLS uint64_t g_mm0, g_mm1, g_mm2, g_mm3;
+extern RECOMP_TLS uint64_t g_mm4, g_mm5, g_mm6, g_mm7;
+#include "recomp_mmx.h"
+
+/* MMX <-> packed single conversions (cvtpi2ps / cvtps2pi / cvttps2pi).
+ * cvtpi2ps fills the low two lanes and keeps the high two. Out-of-range
+ * results give the x86 "integer indefinite" 0x80000000. */
+static inline RecompXmm recomp_cvtpi2ps(RecompXmm x, uint64_t mm) {
+    x.f[0] = (float)(int32_t)(uint32_t)mm;
+    x.f[1] = (float)(int32_t)(uint32_t)(mm >> 32);
+    return x;
+}
+static inline uint32_t recomp_f2i_round(float f) {
+    return (f >= -2147483648.0f && f < 2147483648.0f)
+        ? (uint32_t)(int32_t)lrintf(f) : 0x80000000u;
+}
+static inline uint32_t recomp_f2i_trunc(float f) {
+    return (f > -2147483649.0f && f < 2147483648.0f)
+        ? (uint32_t)(int32_t)f : 0x80000000u;
+}
+static inline uint64_t recomp_cvtps2pi(RecompXmm x) {
+    return (uint64_t)recomp_f2i_round(x.f[0]) |
+           ((uint64_t)recomp_f2i_round(x.f[1]) << 32);
+}
+static inline uint64_t recomp_cvttps2pi(RecompXmm x) {
+    return (uint64_t)recomp_f2i_trunc(x.f[0]) |
+           ((uint64_t)recomp_f2i_trunc(x.f[1]) << 32);
+}
+
+/* Atomic read-modify-write for lifted cmpxchg / xadd. Guest threads are
+ * concurrent host threads, so these must really be atomic. Each returns the
+ * previous value of the guest location. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+static inline uint32_t recomp_cmpxchg32(uint32_t addr, uint32_t cmp, uint32_t xchg) {
+    return (uint32_t)_InterlockedCompareExchange((volatile long *)XBOX_PTR(addr),
+                                                 (long)xchg, (long)cmp);
+}
+static inline uint32_t recomp_cmpxchg16(uint32_t addr, uint32_t cmp, uint32_t xchg) {
+    return (uint16_t)_InterlockedCompareExchange16((volatile short *)XBOX_PTR(addr),
+                                                   (short)xchg, (short)cmp);
+}
+static inline uint32_t recomp_cmpxchg8(uint32_t addr, uint32_t cmp, uint32_t xchg) {
+    return (uint8_t)_InterlockedCompareExchange8((volatile char *)XBOX_PTR(addr),
+                                                 (char)xchg, (char)cmp);
+}
+static inline uint32_t recomp_xadd32(uint32_t addr, uint32_t add) {
+    return (uint32_t)_InterlockedExchangeAdd((volatile long *)XBOX_PTR(addr), (long)add);
+}
+#else
+static inline uint32_t recomp_cmpxchg32(uint32_t addr, uint32_t cmp, uint32_t xchg) {
+    return __sync_val_compare_and_swap((volatile uint32_t *)XBOX_PTR(addr), cmp, xchg);
+}
+static inline uint32_t recomp_cmpxchg16(uint32_t addr, uint32_t cmp, uint32_t xchg) {
+    return __sync_val_compare_and_swap((volatile uint16_t *)XBOX_PTR(addr),
+                                       (uint16_t)cmp, (uint16_t)xchg);
+}
+static inline uint32_t recomp_cmpxchg8(uint32_t addr, uint32_t cmp, uint32_t xchg) {
+    return __sync_val_compare_and_swap((volatile uint8_t *)XBOX_PTR(addr),
+                                       (uint8_t)cmp, (uint8_t)xchg);
+}
+static inline uint32_t recomp_xadd32(uint32_t addr, uint32_t add) {
+    return __sync_fetch_and_add((volatile uint32_t *)XBOX_PTR(addr), add);
+}
+#endif
 
 /* -- construction -- */
 
@@ -550,6 +637,24 @@ static inline uint32_t BSWAP32(uint32_t v) {
            ((v << 8) & 0xFF0000) | ((v << 24) & 0xFF000000u);
 }
 
+static inline uint32_t RECOMP_BSF32(uint32_t v) {
+    uint32_t index = 0;
+    while ((v & 1u) == 0u) {
+        v >>= 1;
+        index++;
+    }
+    return index;
+}
+
+static inline uint32_t RECOMP_BSR32(uint32_t v) {
+    uint32_t index = 31;
+    while ((v & 0x80000000u) == 0u) {
+        v <<= 1;
+        index--;
+    }
+    return index;
+}
+
 static inline uint16_t BSWAP16(uint16_t v) {
     return (uint16_t)((v >> 8) | (v << 8));
 }
@@ -634,6 +739,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  */
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
+    uint32_t _saved_ebx = g_ebx, _saved_esi = g_esi, _saved_edi = g_edi; \
+    uint32_t _saved_ebp = g_ebp; \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
@@ -644,7 +751,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); \
+        g_ebx = _saved_ebx; g_esi = _saved_esi; g_edi = _saved_edi; g_ebp = _saved_ebp; } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
@@ -659,6 +767,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  */
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
+    uint32_t _saved_ebx = g_ebx, _saved_esi = g_esi, _saved_edi = g_edi; \
+    uint32_t _saved_ebp = g_ebp; \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
@@ -668,7 +778,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); \
+        g_ebx = _saved_ebx; g_esi = _saved_esi; g_edi = _saved_edi; g_ebp = _saved_ebp; } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
@@ -679,6 +790,13 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * No return address is pushed - reuses the current frame's return addr.
  * Used for tail-call optimization where the original code uses
  * jmp [reg] instead of call [reg].
+ *
+ * Unlike RECOMP_ICALL, callee-saved registers are NOT restored afterwards.
+ * The target is a continuation of the current function (a jump-table case
+ * or a tail call), and it is the code that pops the caller's saved
+ * ebx/esi/edi before its ret. Restoring the pre-jump values here would
+ * overwrite those with mid-function state; switch statements lowered to
+ * jmp [reg*4+table] then return with corrupted callee-saved registers.
  */
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
@@ -718,9 +836,80 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #define xmm5 g_xmm5
 #define xmm6 g_xmm6
 #define xmm7 g_xmm7
+#define mm0 g_mm0
+#define mm1 g_mm1
+#define mm2 g_mm2
+#define mm3 g_mm3
+#define mm4 g_mm4
+#define mm5 g_mm5
+#define mm6 g_mm6
+#define mm7 g_mm7
 /* ebp is NOT global - it's local in each function.
  * For __SEH_prolog/epilog, use g_seh_ebp to bridge. */
 #endif
+
+/* ================================================================
+ * rep movs / rep stos
+ *
+ * Honour EFLAGS.DF and the element-at-a-time semantics of the real
+ * instructions. Forward copies whose destination starts inside the
+ * source replicate the leading bytes on hardware (LZ decoders depend on
+ * it) and are undefined for memcpy, so those take the element loop.
+ * ================================================================ */
+/* Device apertures (NV2A, APU, AC'97, USB...) live at 0xFD000000 and up. A
+ * project that emulates a device faults those accesses into a handler that
+ * decodes the faulting mov; host memcpy/memset cannot be decoded, so string
+ * operations touching the range go element by element. */
+#define RECOMP_IS_HW_RANGE(addr, bytes) \
+    ((uint32_t)(addr) >= 0xFD000000u || (uint32_t)((addr) + (bytes)) > 0xFD000000u)
+
+static inline void recomp_rep_movs(uint32_t size)
+{
+    uint32_t count = g_ecx;
+    uint32_t bytes = count * size;
+    if (count) {
+        int hw = !g_df && (RECOMP_IS_HW_RANGE(g_esi, bytes) || RECOMP_IS_HW_RANGE(g_edi, bytes));
+        if (!g_df) {
+            if (hw || (g_edi > g_esi && g_edi - g_esi < bytes)) {
+                uint32_t i;
+                for (i = 0; i < bytes; i += size) {
+                    if (size == 1) MEM8(g_edi + i) = MEM8(g_esi + i);
+                    else if (size == 2) MEM16(g_edi + i) = MEM16(g_esi + i);
+                    else MEM32(g_edi + i) = MEM32(g_esi + i);
+                }
+            } else {
+                memcpy((void *)XBOX_PTR(g_edi), (const void *)XBOX_PTR(g_esi), bytes);
+            }
+            g_esi += bytes; g_edi += bytes;
+        } else {
+            /* Backward: first element at edi/esi, last at edi/esi - (n-1)*size. */
+            uint32_t span = bytes - size;
+            memmove((void *)XBOX_PTR(g_edi - span), (const void *)XBOX_PTR(g_esi - span), bytes);
+            g_esi -= bytes; g_edi -= bytes;
+        }
+    }
+    g_ecx = 0;
+}
+
+static inline void recomp_rep_stos(uint32_t size)
+{
+    uint32_t count = g_ecx;
+    uint32_t i;
+    uint32_t addr = g_edi;
+    if (size == 1 && !g_df && !RECOMP_IS_HW_RANGE(g_edi, count)) {
+        memset((void *)XBOX_PTR(g_edi), (uint8_t)g_eax, count);
+        g_edi += count;
+    } else {
+        for (i = 0; i < count; i++) {
+            if (size == 1) MEM8(addr) = (uint8_t)g_eax;
+            else if (size == 2) MEM16(addr) = (uint16_t)g_eax;
+            else MEM32(addr) = g_eax;
+            addr = g_df ? addr - size : addr + size;
+        }
+        g_edi = addr;
+    }
+    g_ecx = 0;
+}
 
 /* ================================================================
  * Forward declarations for translated functions

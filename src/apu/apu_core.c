@@ -58,6 +58,16 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* Host hook for the APU interrupt line (the standalone port has no PCI bus).
+ * Called with 1 when the line is asserted. */
+static void (*g_apu_irq_callback)(int level);
+
+void mcpx_apu_set_irq_callback(void (*cb)(int level))
+{
+    g_apu_irq_callback = cb;
+}
+
+static int g_apu_irq_raises;
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -70,6 +80,8 @@ static void update_irq(MCPXAPUState *d)
         /* In standalone mode we don't raise a PCI IRQ; the game's kernel
          * stub will poll ISTS directly or we'll signal via a flag. */
         pci_irq_assert(PCI_DEVICE(d));
+        g_apu_irq_raises++;
+        if (g_apu_irq_callback) g_apu_irq_callback(1);
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         pci_irq_deassert(PCI_DEVICE(d));
@@ -342,6 +354,14 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
 static void throttle(MCPXAPUState *d)
 {
+    /* Win32 critical sections are not fair: a thread that releases and
+     * re-enters in a tight loop starves waiters indefinitely. MMIO from guest
+     * threads (voice_lock, register writes) waits on d->lock, so hand it over
+     * once per frame. */
+    qemu_mutex_unlock(&d->lock);
+    SwitchToThread();
+    qemu_mutex_lock(&d->lock);
+
     if (d->ep_frame_div % 8) {
         return;
     }
@@ -355,7 +375,9 @@ static void throttle(MCPXAPUState *d)
 
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-        int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
+        /* round up: truncating sub-millisecond waits to 0 meant never
+         * waiting (and never releasing the lock) */
+        int64_t remaining_ms = (d->next_frame_time_us - now_us + 999) / 1000;
         if (remaining_ms > 0) {
             qemu_cond_timedwait(&d->cond, &d->lock, (int)remaining_ms);
         } else {
@@ -432,6 +454,15 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        if (!apu_active)
+            d->set_irq = true;
+        /* As in xemu's frame loop: voice notifications set ISTS bits and
+         * request an interrupt; evaluate it once per frame. */
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
@@ -474,14 +505,8 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
     mcpx_apu_vp_reset(d);
 
-    if (d->gp.dsp) {
-        memset((void *)d->gp.dsp->core.pram_opcache, 0,
-               sizeof(d->gp.dsp->core.pram_opcache));
-    }
-    if (d->ep.dsp) {
-        memset((void *)d->ep.dsp->core.pram_opcache, 0,
-               sizeof(d->ep.dsp->core.pram_opcache));
-    }
+    if (d->gp.dsp) dsp_invalidate_opcache(d->gp.dsp);
+    if (d->ep.dsp) dsp_invalidate_opcache(d->ep.dsp);
     d->set_irq = false;
 }
 
@@ -527,10 +552,21 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
     }
 
+    /* The frame throttle waits in millisecond steps; at the default ~15.6 ms
+     * timer resolution every wait overshoots and the APU ran at about a
+     * third of real time, which slows every audio-clocked consumer (XMV). */
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#endif
+
     /* Start background frame thread */
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);
+    /* As xemu's reset_hold / VM-start path: let the frame thread run. It
+     * was left parked here, so the VP/GP/EP never processed a frame and
+     * DirectSound waited forever on its GP command mailbox. */
+    mcpx_apu_resume(d);
     qemu_mutex_unlock(&d->lock);
 
     fprintf(stderr, "[APU] MCPX APU initialized (standalone)\n");
@@ -597,9 +633,17 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
  * addr is offset from APU base (0xFE800000)
  * ============================================================ */
 
+uint64_t mcpx_apu_gp_read(MCPXAPUState *d, hwaddr addr);
+void mcpx_apu_gp_write(MCPXAPUState *d, hwaddr addr, uint64_t val);
+uint64_t mcpx_apu_ep_read(MCPXAPUState *d, hwaddr addr);
+void mcpx_apu_ep_write(MCPXAPUState *d, hwaddr addr, uint64_t val);
+
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
+    /* GP and EP DSP windows (xemu maps these as 64 KB subregions). */
+    if (addr >= 0x30000 && addr < 0x40000) return mcpx_apu_gp_read(d, addr - 0x30000);
+    if (addr >= 0x50000 && addr < 0x60000) return mcpx_apu_ep_read(d, addr - 0x50000);
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
@@ -611,6 +655,8 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
     if (!d) return;
+    if (addr >= 0x30000 && addr < 0x40000) { mcpx_apu_gp_write(d, addr - 0x30000, val); return; }
+    if (addr >= 0x50000 && addr < 0x60000) { mcpx_apu_ep_write(d, addr - 0x50000, val); return; }
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
 }
 
@@ -813,5 +859,30 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
                 InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
             }
         }
+    }
+}
+
+/* One-line APU status for host-side diagnostics. */
+extern int g_vp_dbg_listed, g_vp_dbg_active;
+void mcpx_apu_debug_status(char *out, size_t len)
+{
+    MCPXAPUState *d = g_state;
+    if (!d) { snprintf(out, len, "no apu"); return; }
+    snprintf(out, len,
+             "sectl=%08X fectl=%08X ists=%08X ien=%08X gprst=%08X eprst=%08X "
+             "gp_cycles=%d ep_cycles=%d frames=%d fps=%d util=%.2f voices=%d/%d raises=%d gpsaddr=%08X",
+             d->regs[NV_PAPU_SECTL], d->regs[NV_PAPU_FECTL], d->regs[NV_PAPU_ISTS],
+             d->regs[NV_PAPU_IEN], d->gp.regs[NV_PAPU_GPRST], d->ep.regs[NV_PAPU_EPRST],
+             g_dbg.gp.cycles, g_dbg.ep.cycles, d->frame_count, g_dbg.frames_processed, g_dbg.utilization, g_vp_dbg_active, g_vp_dbg_listed, g_apu_irq_raises, d->regs[NV_PAPU_GPSADDR]);
+    {
+        /* ask the frame thread for a voice description and wait briefly */
+        extern volatile int g_vp_dbg_want;
+        extern char g_vp_dbg_desc[1024];
+        size_t n = strlen(out);
+        int tries;
+        g_vp_dbg_desc[0] = 0;
+        g_vp_dbg_want = 1;
+        for (tries = 0; tries < 50 && g_vp_dbg_want; ++tries) Sleep(1);
+        snprintf(out + n, len - n, "\n  [VOICES]%s", g_vp_dbg_desc);
     }
 }

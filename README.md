@@ -413,17 +413,21 @@ licence:
 
 | Component | Licence | Copyright |
 |---|---|---|
-| the MCPX APU sources in `src/apu/` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
+| the MCPX APU sources listed in `NOTICE` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
+| `src/apu/dsp/` | GPL-2.0-or-later | ARAnyM, Hatari, espes, Matt Borgerson, and contributors |
+| `src/d3d/d3d8_nv2a_psh.c` and `.h` | GPL-2.0-or-later | xemu and xboxrecomp contributors |
 | `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel |
 | everything else | MIT | sp00nz and contributors |
 
-The APU and the NV2A register definitions were extracted from
+Parts of the APU and the NV2A register definitions were extracted from
 [xemu](https://github.com/xemu-project/xemu) and are that project's work, not
 ours. LGPL-2.1 expressly permits linking them from MIT or proprietary code, so
 a recompiled game is unaffected; what it asks is that the notices stay, the
 source stays available, and users can relink against a modified library.
-[LICENSES/LGPL-2.1.txt](LICENSES/LGPL-2.1.txt) is the verbatim licence text —
-shipping it alongside those files is a requirement, not a courtesy.
+[LICENSES/LGPL-2.1.txt](LICENSES/LGPL-2.1.txt) and
+[LICENSES/GPL-2.0.txt](LICENSES/GPL-2.0.txt) contain the corresponding licence
+texts. The GPL-covered DSP and register-combiner code also affects the terms
+for linked executable distributions; see [NOTICE](NOTICE).
 
 Not every file under `src/apu/` and `src/nv2a/` is xemu-derived. See
 [NOTICE](NOTICE) for the exact list, each with the copyright it actually

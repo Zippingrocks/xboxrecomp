@@ -931,7 +931,19 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     sb_append(&sb, "    /* Input register aliases */\n");
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         if (inputs & (1u << i)) {
-            sb_append(&sb, "    float4 v%d = input.v%d;\n", i, i);
+            /* Xbox D3DCOLOR is an ARGB DWORD, so its little-endian byte
+             * stream is B,G,R,A.  D3D11's R8G8B8A8 vertex element exposes
+             * those bytes as B,G,R,A components and therefore needs an R/B
+             * swizzle before the translated NV2A program consumes it.
+             *
+             * The fixed-function translator already performs this exact
+             * conversion.  Omitting it here made programmable-shader draws
+             * exchange red and blue: yellow/orange UI art became cyan/blue
+             * and vertex modulation put a blue cast over sampled textures. */
+            if (i == 3 || i == 4 || i == 7)
+                sb_append(&sb, "    float4 v%d = input.v%d.bgra;\n", i, i);
+            else
+                sb_append(&sb, "    float4 v%d = input.v%d;\n", i, i);
         }
     }
     sb_append(&sb, "\n");

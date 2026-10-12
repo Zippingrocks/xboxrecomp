@@ -10,6 +10,7 @@
 #include "kernel.h"
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -170,22 +171,116 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
  * TODO: If multithreading is needed, implement a shadow CS mapping
  * (Xbox VA → native Windows CRITICAL_SECTION).
  */
+/*
+ * Shadow mapping: each guest critical section address gets a reentrant host
+ * lock, created on first use (titles also enter statically zeroed sections
+ * they never initialised). Runtimes that give guest threads real host threads
+ * (PsCreateSystemThreadEx) need it: with no-ops, Godzilla: Save the Earth's
+ * loader thread and its main thread edited the same stream array at once and
+ * crashed on half-built entries.
+ *
+ * Do not use a native CRITICAL_SECTION here. Xbox worker threads can return
+ * through incomplete translated unwind paths while holding a guest lock. A
+ * Win32 critical section is then abandoned forever, unlike a kernel mutex,
+ * and the window-owning thread deadlocks on its next Enter. Keep the owner as
+ * a host thread id instead: a waiter can detect that the owner no longer
+ * exists, reclaim the guest lock, and let the title continue.
+ */
+typedef struct {
+    void *key;
+    volatile LONG owner;
+    volatile LONG depth;
+} ShadowCS;
+
+#define SHADOW_CS_BUCKETS 8192
+static ShadowCS *g_shadow_cs[SHADOW_CS_BUCKETS];
+static SRWLOCK g_shadow_cs_lock = SRWLOCK_INIT;
+
+static ShadowCS *shadow_cs(void *key)
+{
+    uintptr_t h = ((uintptr_t)key >> 3) * 2654435761u;
+    unsigned i = (unsigned)(h % SHADOW_CS_BUCKETS);
+    ShadowCS *s;
+    AcquireSRWLockShared(&g_shadow_cs_lock);
+    for (unsigned n = 0; n < SHADOW_CS_BUCKETS; ++n) {
+        s = g_shadow_cs[(i + n) % SHADOW_CS_BUCKETS];
+        if (!s) break;
+        if (s->key == key) { ReleaseSRWLockShared(&g_shadow_cs_lock); return s; }
+    }
+    ReleaseSRWLockShared(&g_shadow_cs_lock);
+    AcquireSRWLockExclusive(&g_shadow_cs_lock);
+    for (unsigned n = 0; n < SHADOW_CS_BUCKETS; ++n) {
+        ShadowCS **slot = &g_shadow_cs[(i + n) % SHADOW_CS_BUCKETS];
+        if (*slot && (*slot)->key == key) { s = *slot; ReleaseSRWLockExclusive(&g_shadow_cs_lock); return s; }
+        if (!*slot) {
+            s = (ShadowCS *)calloc(1, sizeof(*s));
+            if (s) {
+                s->key = key;
+                *slot = s;
+            }
+            ReleaseSRWLockExclusive(&g_shadow_cs_lock);
+            return s;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_shadow_cs_lock);
+    return NULL;   /* table full: degrade to unsynchronised */
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution, no contention */
+    ShadowCS *s = shadow_cs((void *)CriticalSection);
+    const LONG thread_id = (LONG)GetCurrentThreadId();
+    if (!s) return;
+    for (;;) {
+        LONG owner = InterlockedCompareExchange(&s->owner, 0, 0);
+        if (owner == thread_id) {
+            InterlockedIncrement(&s->depth);
+            return;
+        }
+        if (owner == 0 &&
+            InterlockedCompareExchange(&s->owner, thread_id, 0) == 0) {
+            InterlockedExchange(&s->depth, 1);
+            return;
+        }
+        if (owner != 0) {
+            HANDLE owner_thread = OpenThread(SYNCHRONIZE, FALSE, (DWORD)owner);
+            BOOL abandoned = owner_thread == NULL &&
+                             GetLastError() == ERROR_INVALID_PARAMETER;
+            if (owner_thread) {
+                abandoned = WaitForSingleObject(owner_thread, 0) == WAIT_OBJECT_0;
+                CloseHandle(owner_thread);
+            }
+            if (abandoned &&
+                InterlockedCompareExchange(&s->owner, 0, owner) == owner) {
+                InterlockedExchange(&s->depth, 0);
+                fprintf(stderr,
+                        "[RTL-CS] recovered abandoned guest lock=%p owner=%lu\n",
+                        CriticalSection, (unsigned long)(DWORD)owner);
+                fflush(stderr);
+                continue;
+            }
+        }
+        if (!SwitchToThread()) Sleep(1);
+    }
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    ShadowCS *s = shadow_cs((void *)CriticalSection);
+    LONG depth;
+    if (!s || s->owner != (LONG)GetCurrentThreadId() || s->depth <= 0) return;
+    depth = InterlockedDecrement(&s->depth);
+    if (depth <= 0) {
+        InterlockedExchange(&s->depth, 0);
+        InterlockedExchange(&s->owner, 0);
+    }
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    /* the shadow lock is created on first use; re-initialising a section
+     * that is in use must not reset the host lock under its owner */
+    (void)shadow_cs((void *)CriticalSection);
 }
 
 /* ============================================================================

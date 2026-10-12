@@ -16,7 +16,9 @@
  */
 
 #include "d3d8_internal.h"
+#include <d3d11_4.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ================================================================
@@ -34,12 +36,26 @@ typedef struct D3D8DeviceState {
     /* D3D11 objects */
     ID3D11Device            *d3d11_device;
     ID3D11DeviceContext     *d3d11_context;
+    ID3D11Device            *scanout_device;
+    ID3D11DeviceContext     *scanout_context;
     IDXGISwapChain          *swap_chain;
 
     /* Default render targets */
     ID3D11RenderTargetView  *default_rtv;
     ID3D11DepthStencilView  *default_dsv;
     ID3D11Texture2D         *default_depth;
+    ID3D11Texture2D         *render_texture;
+    ID3D11Texture2D         *ready_texture;
+    ID3D11Texture2D         *readback_texture;
+    HANDLE                   scanout_thread;
+    volatile LONG            scanout_active;
+    volatile LONG            scanout_ready;
+    volatile LONG            scanout_generation;
+    volatile LONG            scanout_cpu_generation;
+    volatile LONG            scanout_visible;
+    CRITICAL_SECTION         scanout_cpu_lock;
+    BOOL                     scanout_cpu_lock_initialized;
+    BYTE                    *scanout_cpu_frame;
 
     /* Window */
     HWND                    hwnd;
@@ -82,23 +98,383 @@ static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 /* Forward declarations */
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
+static BOOL d3d8_capture_backbuffer_bmp(const char *path);
+
+static DWORD WINAPI d3d8_scanout_thread(void *opaque)
+{
+    D3D8DeviceState *state = (D3D8DeviceState *)opaque;
+    LARGE_INTEGER frequency, now;
+    LONGLONG next_present, stats_start, period;
+    unsigned presented = 0, fresh = 0, repeated = 0;
+    unsigned repeat_run = 0, max_repeat_run = 0;
+    LONG copied_generation = -1;
+    LONG presented_generation = -1;
+
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    next_present = stats_start = now.QuadPart;
+    period = frequency.QuadPart / 30;
+
+    while (InterlockedCompareExchange(&state->scanout_active, 0, 0)) {
+        ID3D11Texture2D *back_buffer = NULL;
+        HRESULT hr = E_FAIL;
+        LONG generation;
+
+        QueryPerformanceCounter(&now);
+        while (now.QuadPart < next_present &&
+               InterlockedCompareExchange(&state->scanout_active, 0, 0)) {
+            LONGLONG remaining = next_present - now.QuadPart;
+            if (remaining > frequency.QuadPart / 500)
+                Sleep(1);
+            else
+                SwitchToThread();
+            QueryPerformanceCounter(&now);
+        }
+        if (!InterlockedCompareExchange(&state->scanout_active, 0, 0))
+            break;
+
+        generation = InterlockedCompareExchange(
+            &state->scanout_generation, 0, 0);
+        if (InterlockedCompareExchange(&state->scanout_ready, 0, 0) &&
+            state->swap_chain && state->ready_texture &&
+            SUCCEEDED(IDXGISwapChain_GetBuffer(
+                state->swap_chain, 0, &IID_ID3D11Texture2D,
+                (void **)&back_buffer))) {
+            /* DXGI_SWAP_EFFECT_SEQUENTIAL preserves the backbuffer.  Reuse it
+             * while the guest is stalled instead of taking the D3D11
+             * immediate-context lock to copy the same texture 30 times/sec. */
+            if (generation != copied_generation) {
+                if (generation == InterlockedCompareExchange(
+                        &state->scanout_cpu_generation, 0, 0) &&
+                    state->scanout_cpu_frame) {
+                    if (TryEnterCriticalSection(&state->scanout_cpu_lock)) {
+                        ID3D11DeviceContext_UpdateSubresource(
+                            state->scanout_context,
+                            (ID3D11Resource *)state->ready_texture,
+                            0, NULL, state->scanout_cpu_frame,
+                            state->width * 4u,
+                            state->width * state->height * 4u);
+                        LeaveCriticalSection(&state->scanout_cpu_lock);
+                    } else {
+                        /* A producer is still completing this generation.
+                         * Present the last complete backbuffer on schedule and
+                         * retry the new frame at the next 30 Hz slot. */
+                        ID3D11Texture2D_Release(back_buffer);
+                        hr = IDXGISwapChain_Present(state->swap_chain, 0, 0);
+                        goto scanout_presented;
+                    }
+                }
+                ID3D11DeviceContext_CopyResource(
+                    state->scanout_context, (ID3D11Resource *)back_buffer,
+                    (ID3D11Resource *)state->ready_texture);
+                copied_generation = generation;
+            }
+            ID3D11Texture2D_Release(back_buffer);
+            hr = IDXGISwapChain_Present(state->swap_chain, 0, 0);
+scanout_presented:
+            if (SUCCEEDED(hr) && presented == 0u) {
+                char capture_first[2];
+                if (GetEnvironmentVariableA("XBOXRECOMP_CAPTURE_FIRST_SCANOUT",
+                                            capture_first,
+                                            sizeof(capture_first)))
+                    d3d8_capture_backbuffer_bmp(
+                        "build-release\\first_scanout.bmp");
+            }
+        }
+
+        next_present += period;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= next_present) {
+            /* Preserve the original 30 Hz phase after a temporary scheduling
+             * delay.  Rebasing to now+period compounds one late present into
+             * another full-frame pause; advancing by whole periods catches
+             * the next real scanout slot without emitting burst frames. */
+            const LONGLONG missed =
+                (now.QuadPart - next_present) / period + 1;
+            next_present += missed * period;
+        }
+        if (SUCCEEDED(hr)) {
+            /* A healthy refresh thread can still repeat a stalled game's
+             * last frame. Report publication progress separately; this is
+             * not a claim that every submitted frame has different pixels. */
+            if (copied_generation != presented_generation) {
+                ++fresh;
+                repeat_run = 0;
+                presented_generation = copied_generation;
+            } else {
+                ++repeated;
+                if (++repeat_run > max_repeat_run)
+                    max_repeat_run = repeat_run;
+            }
+        }
+        if (SUCCEEDED(hr) && ++presented == 300u) {
+            LONGLONG elapsed = now.QuadPart - stats_start;
+            unsigned fps_milli = elapsed > 0
+                ? (unsigned)(((uint64_t)presented * 1000u *
+                              frequency.QuadPart) / (uint64_t)elapsed)
+                : 0u;
+            fprintf(stderr,
+                    "[SCANOUT-CADENCE] frames=%u fps=%u.%03u fresh=%u "
+                    "repeated=%u max-repeat-run=%u\n",
+                    presented, fps_milli / 1000u, fps_milli % 1000u,
+                    fresh, repeated, max_repeat_run);
+            fflush(stderr);
+            presented = 0;
+            fresh = repeated = 0;
+            max_repeat_run = repeat_run;
+            stats_start = now.QuadPart;
+        }
+    }
+    return 0;
+}
+
+static void d3d8_start_scanout(D3D8DeviceState *state)
+{
+    if (!state->scanout_thread) {
+        InterlockedExchange(&state->scanout_active, 1);
+        state->scanout_thread = CreateThread(
+            NULL, 0, d3d8_scanout_thread, state, 0, NULL);
+        if (!state->scanout_thread)
+            InterlockedExchange(&state->scanout_active, 0);
+        else
+            /* Scanout must remain schedulable while the guest thread parses
+             * and uploads a submenu bundle.  It only performs one bounded
+             * upload/present per 33.3 ms, so time-critical priority is safe
+             * and prevents asset work from starving the display clock. */
+            SetThreadPriority(state->scanout_thread,
+                              THREAD_PRIORITY_TIME_CRITICAL);
+    }
+    if (!InterlockedExchange(&state->scanout_visible, 1) && state->hwnd) {
+        ShowWindowAsync(state->hwnd, SW_SHOW);
+        UpdateWindow(state->hwnd);
+    }
+}
+
+void d3d8_SubmitRGBAFrame(const void *pixels, UINT row_pitch,
+                          UINT slice_pitch)
+{
+    D3D8DeviceState *state = &g_device_state;
+    LONG generation;
+    UINT y;
+    const BYTE *source = (const BYTE *)pixels;
+    (void)slice_pitch;
+    if (!pixels || !state->scanout_cpu_frame ||
+        !state->scanout_cpu_lock_initialized)
+        return;
+    /* Rendering and movie decode must never queue behind scanout.  A newer
+     * frame arrives on the next tick, so dropping only a contended mailbox
+     * write is preferable to stalling either producer and cascading latency. */
+    if (!TryEnterCriticalSection(&state->scanout_cpu_lock))
+        return;
+    for (y = 0; y < state->height; ++y)
+        memcpy(state->scanout_cpu_frame + (size_t)y * state->width * 4u,
+               source + (size_t)y * row_pitch, state->width * 4u);
+    generation = InterlockedIncrement(&state->scanout_generation);
+    InterlockedExchange(&state->scanout_cpu_generation, generation);
+    LeaveCriticalSection(&state->scanout_cpu_lock);
+    InterlockedExchange(&state->scanout_ready, 1);
+    d3d8_start_scanout(state);
+}
+
+/* Temporary bring-up aid: capture the actual D3D11 backbuffer so projects can
+ * verify visual progress even when desktop window capture is unavailable. */
+static BOOL d3d8_capture_backbuffer_bmp(const char *path)
+{
+    ID3D11Texture2D *back_buffer = NULL;
+    ID3D11Texture2D *staging = NULL;
+    D3D11_TEXTURE2D_DESC desc;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    BITMAPFILEHEADER file_header;
+    BITMAPINFOHEADER info_header;
+    unsigned char *row = NULL;
+    FILE *file = NULL;
+    ID3D11Device *capture_device = g_device_state.d3d11_device;
+    ID3D11DeviceContext *capture_context = g_device_state.d3d11_context;
+    HRESULT hr;
+    BOOL ok = FALSE;
+
+    if (g_device_state.scanout_ready && g_device_state.ready_texture) {
+        back_buffer = g_device_state.ready_texture;
+        capture_device = g_device_state.scanout_device;
+        capture_context = g_device_state.scanout_context;
+        ID3D11Texture2D_AddRef(back_buffer);
+        hr = S_OK;
+    } else if (g_device_state.render_texture) {
+        back_buffer = g_device_state.render_texture;
+        ID3D11Texture2D_AddRef(back_buffer);
+        hr = S_OK;
+    } else {
+        hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
+                                      &IID_ID3D11Texture2D,
+                                      (void **)&back_buffer);
+        capture_device = g_device_state.scanout_device;
+        capture_context = g_device_state.scanout_context;
+    }
+    if (FAILED(hr)) goto cleanup;
+
+    ID3D11Texture2D_GetDesc(back_buffer, &desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    hr = ID3D11Device_CreateTexture2D(capture_device, &desc,
+                                      NULL, &staging);
+    if (FAILED(hr)) goto cleanup;
+
+    ID3D11DeviceContext_CopyResource(capture_context,
+                                     (ID3D11Resource *)staging,
+                                     (ID3D11Resource *)back_buffer);
+    memset(&mapped, 0, sizeof(mapped));
+    hr = ID3D11DeviceContext_Map(capture_context,
+                                 (ID3D11Resource *)staging, 0,
+                                 D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) goto cleanup;
+
+    row = (unsigned char *)malloc((size_t)desc.Width * 4u);
+    if (!row) {
+        ID3D11DeviceContext_Unmap(capture_context,
+                                  (ID3D11Resource *)staging, 0);
+        goto cleanup;
+    }
+
+    file = fopen(path, "wb");
+    if (!file) {
+        ID3D11DeviceContext_Unmap(capture_context,
+                                  (ID3D11Resource *)staging, 0);
+        goto cleanup;
+    }
+
+    memset(&file_header, 0, sizeof(file_header));
+    memset(&info_header, 0, sizeof(info_header));
+    file_header.bfType = 0x4D42;
+    file_header.bfOffBits = sizeof(file_header) + sizeof(info_header);
+    file_header.bfSize = file_header.bfOffBits + desc.Width * desc.Height * 4u;
+    info_header.biSize = sizeof(info_header);
+    info_header.biWidth = (LONG)desc.Width;
+    info_header.biHeight = (LONG)desc.Height;
+    info_header.biPlanes = 1;
+    info_header.biBitCount = 32;
+    info_header.biCompression = BI_RGB;
+    info_header.biSizeImage = desc.Width * desc.Height * 4u;
+
+    fwrite(&file_header, sizeof(file_header), 1, file);
+    fwrite(&info_header, sizeof(info_header), 1, file);
+    for (LONG y = (LONG)desc.Height - 1; y >= 0; --y) {
+        const unsigned char *src =
+            (const unsigned char *)mapped.pData + (size_t)y * mapped.RowPitch;
+        for (UINT x = 0; x < desc.Width; ++x) {
+            row[x * 4u + 0u] = src[x * 4u + 2u];
+            row[x * 4u + 1u] = src[x * 4u + 1u];
+            row[x * 4u + 2u] = src[x * 4u + 0u];
+            row[x * 4u + 3u] = 0xFFu;
+        }
+        fwrite(row, (size_t)desc.Width * 4u, 1, file);
+    }
+    ok = TRUE;
+    ID3D11DeviceContext_Unmap(capture_context,
+                              (ID3D11Resource *)staging, 0);
+
+cleanup:
+    if (file) fclose(file);
+    free(row);
+    if (staging) ID3D11Texture2D_Release(staging);
+    if (back_buffer) ID3D11Texture2D_Release(back_buffer);
+    fprintf(stderr, "D3D8: framebuffer capture %s: %s\n",
+            ok ? "written" : "failed", path);
+    fflush(stderr);
+    return ok;
+}
+
+/* Public: save the current backbuffer (debug captures from title code). */
+void d3d8_capture_backbuffer_bmp_public(const char *path)
+{
+    d3d8_capture_backbuffer_bmp(path);
+}
 
 /* ================================================================
  * Public frame pump (called from recompiled game code)
  * ================================================================ */
 void d3d8_PresentFrame(void)
 {
+    static DWORD present_count = 0;
+
+    present_count++;
+    {
+        /* XBOXRECOMP_CAPTURE="n,n,..." overrides the default capture frames. */
+        static DWORD frames[32];
+        static int frame_count = -1;
+        if (frame_count < 0) {
+            char spec[256];
+            frame_count = 0;
+            if (GetEnvironmentVariableA("XBOXRECOMP_CAPTURE", spec, sizeof(spec))) {
+                char *p = spec;
+                frame_count = 0;
+                while (*p && frame_count < 32) {
+                    frames[frame_count++] = strtoul(p, &p, 10);
+                    while (*p == ',' || *p == ' ') p++;
+                }
+            }
+        }
+        for (int i = 0; i < frame_count; ++i) {
+            if (present_count == frames[i]) {
+                char path[64];
+                sprintf_s(path, sizeof(path), "build-release\\frame_%04lu.bmp",
+                          (unsigned long)present_count);
+                d3d8_capture_backbuffer_bmp(path);
+            }
+        }
+    }
+
     /* Pump Windows messages */
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT) ExitProcess(0);
+        if (msg.message == WM_QUIT) {
+            fprintf(stderr,
+                    "[HOST-EXIT] d3d8_PresentFrame received WM_QUIT code=%llu\n",
+                    (unsigned long long)msg.wParam);
+            fflush(stderr);
+            ExitProcess((UINT)msg.wParam);
+        }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
 
-    /* Present the backbuffer (VSync = 1) */
-    if (g_device_state.swap_chain)
-        IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    /* Publish a complete frame atomically.  The independent 30 Hz scanout
+     * thread repeats this image if guest emulation or asset loading stalls,
+     * so host presentation never inherits guest scheduling jitter. */
+    if (g_device_state.render_texture && g_device_state.readback_texture &&
+        g_device_state.scanout_cpu_frame) {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        UINT y;
+        LONG generation;
+        ID3D11DeviceContext_CopyResource(
+            g_device_state.d3d11_context,
+            (ID3D11Resource *)g_device_state.readback_texture,
+            (ID3D11Resource *)g_device_state.render_texture);
+        memset(&mapped, 0, sizeof(mapped));
+        if (SUCCEEDED(ID3D11DeviceContext_Map(
+                g_device_state.d3d11_context,
+                (ID3D11Resource *)g_device_state.readback_texture,
+                0, D3D11_MAP_READ, 0, &mapped))) {
+            EnterCriticalSection(&g_device_state.scanout_cpu_lock);
+            for (y = 0; y < g_device_state.height; ++y)
+                memcpy(g_device_state.scanout_cpu_frame +
+                           (size_t)y * g_device_state.width * 4u,
+                       (const BYTE *)mapped.pData +
+                           (size_t)y * mapped.RowPitch,
+                       g_device_state.width * 4u);
+            generation = InterlockedIncrement(
+                &g_device_state.scanout_generation);
+            InterlockedExchange(&g_device_state.scanout_cpu_generation,
+                                generation);
+            LeaveCriticalSection(&g_device_state.scanout_cpu_lock);
+            ID3D11DeviceContext_Unmap(
+                g_device_state.d3d11_context,
+                (ID3D11Resource *)g_device_state.readback_texture, 0);
+            InterlockedExchange(&g_device_state.scanout_ready, 1);
+            d3d8_start_scanout(&g_device_state);
+        }
+    }
 }
 
 /* ================================================================
@@ -111,8 +487,169 @@ ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_co
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
-UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
-UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
+/* ================================================================
+ * Offscreen render targets for the NV2A translator.
+ *
+ * NV2A titles render into arbitrary RAM surfaces (SET_SURFACE_COLOR_OFFSET)
+ * and later sample them as textures; xemu keeps a surface cache for this.
+ * Here each non-display surface address gets a D3D11 colour + depth target,
+ * and the translator binds it while that surface is current and samples it
+ * through d3d8_rt_texture() when a texture points at the same address.
+ * "Current target" state (RTV/DSV/size) is what Clear, the viewport and the
+ * pre-transformed vertex mapping (ScreenSize) follow.
+ * ================================================================ */
+typedef struct {
+    uint32_t key;
+    UINT w, h;
+    ID3D11Texture2D *tex, *dtex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+    ID3D11DepthStencilView *dsv;
+    IDirect3DTexture8 *wrap;
+} D3D8RtEntry;
+static D3D8RtEntry g_rts[48];
+static ID3D11RenderTargetView *g_cur_rtv;
+static ID3D11DepthStencilView *g_cur_dsv;
+static UINT g_cur_w, g_cur_h;
+
+static ID3D11RenderTargetView *cur_rtv(void) { return g_cur_rtv ? g_cur_rtv : g_device_state.default_rtv; }
+static ID3D11DepthStencilView *cur_dsv(void) { return g_cur_rtv ? g_cur_dsv : g_device_state.default_dsv; }
+
+static void bind_target(ID3D11RenderTargetView *rtv, ID3D11DepthStencilView *dsv, UINT w, UINT h)
+{
+    D3D11_VIEWPORT vp;
+    ID3D11ShaderResourceView *nulls[4] = { NULL, NULL, NULL, NULL };
+    /* a target cannot stay bound as a shader input while drawn into */
+    ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context, 0, 4, nulls);
+    ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1, &rtv, dsv);
+    vp.TopLeftX = 0.0f; vp.TopLeftY = 0.0f;
+    vp.Width = (FLOAT)w; vp.Height = (FLOAT)h;
+    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &vp);
+}
+
+static D3D8RtEntry *rt_get(uint32_t key, UINT w, UINT h, int create)
+{
+    int i, free_slot = -1;
+    for (i = 0; i < 48; ++i) {
+        if (g_rts[i].key == key && g_rts[i].tex) {
+            if (!create || (g_rts[i].w == w && g_rts[i].h == h)) return &g_rts[i];
+            free_slot = i;   /* same address, new size: rebuild in place */
+            break;
+        }
+        if (!g_rts[i].tex && free_slot < 0) free_slot = i;
+    }
+    if (!create || free_slot < 0 || !w || !h) return NULL;
+    {
+        D3D8RtEntry *e = &g_rts[free_slot];
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Device *dev = g_device_state.d3d11_device;
+        if (e->rtv) ID3D11RenderTargetView_Release(e->rtv);
+        if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+        if (e->dsv) ID3D11DepthStencilView_Release(e->dsv);
+        if (e->tex) ID3D11Texture2D_Release(e->tex);
+        if (e->dtex) ID3D11Texture2D_Release(e->dtex);
+        memset(e, 0, sizeof(*e));
+        memset(&td, 0, sizeof(td));
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        /* Match the renderer's publication texture.  Render targets are
+         * promoted with CopyResource at a guest frame boundary, which
+         * requires an identical DXGI format.  The old BGRA surface could
+         * neither be copied to the RGBA publication texture nor directly to
+         * the swapchain owned by the separate scanout device. */
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &e->tex))) return NULL;
+        ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)e->tex, NULL, &e->rtv);
+        ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
+        td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &e->dtex)))
+            ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)e->dtex, NULL, &e->dsv);
+        e->key = key; e->w = w; e->h = h;
+        {
+            /* expose as an ordinary IDirect3DTexture8 whose view is the RT */
+            IDirect3DTexture8 *t = NULL;
+            if (SUCCEEDED(d3d8_CreateTextureImpl(1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8, &t)) && t) {
+                D3D8Texture *dt = (D3D8Texture *)t;
+                if (dt->srv) ID3D11ShaderResourceView_Release(dt->srv);
+                ID3D11ShaderResourceView_AddRef(e->srv);
+                dt->srv = e->srv;
+                dt->width = w; dt->height = h;
+                dt->dirty = FALSE;
+                e->wrap = t;
+            }
+        }
+        {
+            float black[4] = {0, 0, 0, 0};
+            ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context, e->rtv, black);
+            if (e->dsv)
+                ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context, e->dsv,
+                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        }
+        return e;
+    }
+}
+
+/* Make guest surface `key` current (0 = the display back buffer). */
+void d3d8_rt_select(uint32_t key, UINT w, UINT h)
+{
+    if (!key) {
+        g_cur_rtv = NULL; g_cur_dsv = NULL; g_cur_w = g_cur_h = 0;
+        bind_target(g_device_state.default_rtv, g_device_state.default_dsv,
+                    g_device_state.width, g_device_state.height);
+        return;
+    }
+    {
+        D3D8RtEntry *e = rt_get(key, w, h, 1);
+        if (!e) return;
+        g_cur_rtv = e->rtv; g_cur_dsv = e->dsv; g_cur_w = e->w; g_cur_h = e->h;
+        bind_target(e->rtv, e->dsv, e->w, e->h);
+    }
+}
+
+/* Texture view of a guest surface rendered earlier, or NULL. */
+IDirect3DTexture8 *d3d8_rt_texture(uint32_t key)
+{
+    D3D8RtEntry *e = rt_get(key, 0, 0, 0);
+    return e ? e->wrap : NULL;
+}
+
+/* Copy a completed guest render target to the host display backbuffer.
+ *
+ * During initial pushbuffer catch-up the translator may encounter several
+ * historical colour surfaces before it knows which one ended the frame.  The
+ * frame-ending surface is authoritative, but its first rendering may already
+ * have gone to an offscreen texture.  Promote that completed image here rather
+ * than forcing every intermediate render-to-texture pass onto the display. */
+void d3d8_rt_present(uint32_t key)
+{
+    D3D8RtEntry *e = rt_get(key, 0, 0, 0);
+    D3D11_TEXTURE2D_DESC source_desc, target_desc;
+    ID3D11DeviceContext *context = g_device_state.d3d11_context;
+
+    if (!e || !e->tex || !g_device_state.render_texture || !context)
+        return;
+
+    ID3D11Texture2D_GetDesc(e->tex, &source_desc);
+    ID3D11Texture2D_GetDesc(g_device_state.render_texture, &target_desc);
+    if (source_desc.Width == target_desc.Width &&
+        source_desc.Height == target_desc.Height &&
+        source_desc.Format == target_desc.Format) {
+        /* Both resources belong to the guest-render device.  PresentFrame
+         * subsequently reads render_texture and publishes it atomically to
+         * the independently paced scanout device. */
+        ID3D11DeviceContext_OMSetRenderTargets(context, 0, NULL, NULL);
+        ID3D11DeviceContext_CopyResource(context,
+                                         (ID3D11Resource *)g_device_state.render_texture,
+                                         (ID3D11Resource *)e->tex);
+    }
+}
+
+UINT                 d3d8_GetBackbufferWidth(void) { return g_cur_rtv ? g_cur_w : g_device_state.width; }
+UINT                 d3d8_GetBackbufferHeight(void) { return g_cur_rtv ? g_cur_h : g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type) {
@@ -164,7 +701,9 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
     scd.Windowed = pp->Windowed;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    /* Preserve the last completed frame so the independent 30 Hz scanout can
+     * present it repeatedly while guest emulation loads or transitions. */
+    scd.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
 
     hr = D3D11CreateDeviceAndSwapChain(
         NULL,
@@ -175,14 +714,47 @@ static HRESULT d3d11_create_device_and_swap_chain(
         D3D11_SDK_VERSION,
         &scd,
         &state->swap_chain,
-        &state->d3d11_device,
+        &state->scanout_device,
         &feature_level,
-        &state->d3d11_context
+        &state->scanout_context
     );
 
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
         return hr;
+    }
+
+    /* Use a second D3D11 device for guest rendering.  The swapchain device is
+     * owned exclusively by the 30 Hz scanout thread, so shader compilation,
+     * texture uploads, and synchronous guest readback can never stall host
+     * presentation. */
+    hr = D3D11CreateDevice(
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
+        NULL, 0, D3D11_SDK_VERSION,
+        &state->d3d11_device, &feature_level, &state->d3d11_context);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: Failed to create render device: 0x%08lX\n",
+                hr);
+        return hr;
+    }
+
+    /* Diagnostic capture can also read the scanout texture from the guest
+     * thread. Serialize both immediate contexts: protecting only the render
+     * device leaves capture racing scanout's CopyResource/UpdateSubresource. */
+    {
+        ID3D11DeviceContext *contexts[2] = {
+            state->d3d11_context, state->scanout_context
+        };
+        unsigned i;
+        for (i = 0; i < 2; ++i) {
+            ID3D11Multithread *multithread = NULL;
+            if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(
+                    contexts[i], &IID_ID3D11Multithread,
+                    (void **)&multithread))) {
+                ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+                ID3D11Multithread_Release(multithread);
+            }
+        }
     }
 
     state->hwnd = pp->hDeviceWindow;
@@ -195,20 +767,58 @@ static HRESULT d3d11_create_device_and_swap_chain(
 static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
 {
     ID3D11Texture2D *back_buffer = NULL;
+    D3D11_TEXTURE2D_DESC render_desc;
     D3D11_TEXTURE2D_DESC depth_desc;
     HRESULT hr;
 
-    /* Create render target view from swap chain back buffer */
+    /* Render offscreen, then atomically publish completed frames to a second
+     * texture.  A separately paced thread owns the actual swapchain. */
     hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
                                    &IID_ID3D11Texture2D,
                                    (void **)&back_buffer);
     if (FAILED(hr)) return hr;
 
+    ID3D11Texture2D_GetDesc(back_buffer, &render_desc);
+    render_desc.Usage = D3D11_USAGE_DEFAULT;
+    render_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    render_desc.CPUAccessFlags = 0;
+    render_desc.MiscFlags = 0;
+    hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &render_desc,
+                                      NULL, &state->render_texture);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(back_buffer);
+        return hr;
+    }
+
     hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
-                                              (ID3D11Resource *)back_buffer,
+                                              (ID3D11Resource *)state->render_texture,
                                               NULL, &state->default_rtv);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(back_buffer);
+        return hr;
+    }
+
+    render_desc.BindFlags = 0;
+    hr = ID3D11Device_CreateTexture2D(state->scanout_device, &render_desc,
+                                      NULL, &state->ready_texture);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(back_buffer);
+        return hr;
+    }
+
+    render_desc.Usage = D3D11_USAGE_STAGING;
+    render_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &render_desc,
+                                      NULL, &state->readback_texture);
     ID3D11Texture2D_Release(back_buffer);
     if (FAILED(hr)) return hr;
+
+    state->scanout_cpu_frame = (BYTE *)malloc(
+        (size_t)state->width * state->height * 4u);
+    if (!state->scanout_cpu_frame) return E_OUTOFMEMORY;
+    InitializeCriticalSection(&state->scanout_cpu_lock);
+    state->scanout_cpu_lock_initialized = TRUE;
+    state->scanout_cpu_generation = -1;
 
     /* Create depth stencil */
     memset(&depth_desc, 0, sizeof(depth_desc));
@@ -311,12 +921,29 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
 
         /* Cleanup D3D11 resources */
         D3D8DeviceState *s = &g_device_state;
+        InterlockedExchange(&s->scanout_active, 0);
+        if (s->scanout_thread) {
+            WaitForSingleObject(s->scanout_thread, 2000);
+            CloseHandle(s->scanout_thread);
+            s->scanout_thread = NULL;
+        }
+        if (s->scanout_cpu_lock_initialized) {
+            DeleteCriticalSection(&s->scanout_cpu_lock);
+            s->scanout_cpu_lock_initialized = FALSE;
+        }
+        free(s->scanout_cpu_frame);
+        s->scanout_cpu_frame = NULL;
         if (s->default_dsv) { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
         if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
         if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
+        if (s->readback_texture) { ID3D11Texture2D_Release(s->readback_texture); s->readback_texture = NULL; }
+        if (s->ready_texture) { ID3D11Texture2D_Release(s->ready_texture); s->ready_texture = NULL; }
+        if (s->render_texture) { ID3D11Texture2D_Release(s->render_texture); s->render_texture = NULL; }
         if (s->swap_chain) { IDXGISwapChain_Release(s->swap_chain); s->swap_chain = NULL; }
         if (s->d3d11_context) { ID3D11DeviceContext_Release(s->d3d11_context); s->d3d11_context = NULL; }
         if (s->d3d11_device) { ID3D11Device_Release(s->d3d11_device); s->d3d11_device = NULL; }
+        if (s->scanout_context) { ID3D11DeviceContext_Release(s->scanout_context); s->scanout_context = NULL; }
+        if (s->scanout_device) { ID3D11Device_Release(s->scanout_device); s->scanout_device = NULL; }
         g_device_initialized = FALSE;
     }
     return (ULONG)ref;
@@ -396,7 +1023,11 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {
-            ExitProcess(0);
+            fprintf(stderr,
+                    "[HOST-EXIT] dev_Present received WM_QUIT code=%llu\n",
+                    (unsigned long long)msg.wParam);
+            fflush(stderr);
+            ExitProcess((UINT)msg.wParam);
         }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
@@ -441,8 +1072,7 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
             ((Color >> 24) & 0xFF) / 255.0f,  /* A */
         };
         ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context,
-                                                   g_device_state.default_rtv,
-                                                   clear_color);
+                                                   cur_rtv(), clear_color);
     }
 
     if (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) {
@@ -450,9 +1080,9 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
         if (Flags & D3DCLEAR_ZBUFFER) clear_flags |= D3D11_CLEAR_DEPTH;
         if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D11_CLEAR_STENCIL;
 
-        ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context,
-                                                    g_device_state.default_dsv,
-                                                    clear_flags, Z, (UINT8)Stencil);
+        if (cur_dsv())
+            ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context,
+                                                      cur_dsv(), clear_flags, Z, (UINT8)Stencil);
     }
 
     return S_OK;
@@ -1104,7 +1734,11 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {
-            ExitProcess(0);
+            fprintf(stderr,
+                    "[HOST-EXIT] dev_Swap received WM_QUIT code=%llu\n",
+                    (unsigned long long)msg.wParam);
+            fflush(stderr);
+            ExitProcess((UINT)msg.wParam);
         }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);

@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -54,6 +55,12 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+/* CPU-visible write-combined alias used by the Xbox D3D runtime for resource
+ * memory. Surface locks commonly return 0xF0000000 | physical_address; this
+ * must name the same RAM pages as the low physical address, not a separate
+ * allocation. */
+#define XBOX_GPU_RAM_ALIAS_BASE 0xF0000000u
+static void *g_gpu_ram_alias = NULL;
 /* Contiguous / physical memory window (see MemoryLayoutInit).
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
@@ -71,6 +78,19 @@ static void *g_nv2a_memory = NULL;
 static void *g_mcpx_memory = NULL;
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+static volatile uint32_t g_dma_device_pointer_va;
+static volatile uint32_t g_dma_put_offset;
+static volatile uint32_t g_dma_get_pointer_offset;
+
+void xbox_Nv2aConfigureDmaProgress(uint32_t device_pointer_va,
+                                   uint32_t dma_put_offset,
+                                   uint32_t dma_get_pointer_offset)
+{
+    g_dma_put_offset = dma_put_offset;
+    g_dma_get_pointer_offset = dma_get_pointer_offset;
+    InterlockedExchange((volatile LONG *)&g_dma_device_pointer_va,
+                        (LONG)device_pointer_va);
+}
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -180,13 +200,47 @@ static const uint32_t MCPX_COUNTERS[] = {
 
 static void *g_mcpx_regs = NULL;
 
+/* GPU vblank handshake with the interrupt engine (xbox_irq_enable_vblank in
+ * kernel_bridge.c). While g_nv2a_intr_hold is set, PMC_INTR_0.PCRTC and
+ * PCRTC_INTR_0 carry a pending vblank and are left alone. PCRTC_INTR_0 is
+ * write-1-to-clear on hardware; plain RAM cannot see a 1 written over a 1, so
+ * the pending value carries a marker bit (NV2A_VBLANK_PENDING). When D3D's DPC
+ * acknowledges by writing 1 the marker disappears, and this thread retires the
+ * interrupt by dropping PMC_INTR_0.PCRTC, which the DPC spins on.
+ * g_nv2a_ack_seq counts loop passes so the engine can wait out a pass that
+ * started before the hold was raised. */
+#define NV2A_VBLANK_PENDING 0x80000001u
+volatile LONG g_nv2a_intr_hold;
+volatile LONG g_nv2a_ack_seq;
+
+/* A project that emulates the APU itself (MMIO routed to the xemu-derived
+ * model) must stop this thread from poking the aperture, which it decommits. */
+void xbox_McpxDisableCounters(void)
+{
+    g_mcpx_regs = NULL;
+    MemoryBarrier();
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        InterlockedIncrement(&g_nv2a_ack_seq);
+        if (g_nv2a_intr_hold == 1) {     /* armed (2 = arming: hands off) */
+            volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)regs + 0x600100);
+            volatile uint32_t *pmc = (volatile uint32_t *)((char *)regs + 0x000100);
+            if (*pcrtc != NV2A_VBLANK_PENDING) {    /* acknowledged */
+                *pcrtc = 0;
+                *pmc &= ~(1u << 24);
+                InterlockedExchange(&g_nv2a_intr_hold, 0);
+            }
+        }
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (g_nv2a_intr_hold &&
+                (NV2A_ACK[i].offset == 0x000100 || NV2A_ACK[i].offset == 0x600100))
+                continue;
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
@@ -205,6 +259,28 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
             if (*get != *put) {
                 *get = *put;
+            }
+        }
+        {
+            uint32_t device_pointer_va = g_dma_device_pointer_va;
+            if (device_pointer_va) {
+                volatile uint32_t *device_slot = (volatile uint32_t *)(
+                    (uintptr_t)device_pointer_va + g_memory_offset);
+                uint32_t device_va = *device_slot;
+                if (device_va >= 0x00010000u && device_va < XBOX_CONTIG_SIZE) {
+                    volatile uint32_t *device = (volatile uint32_t *)(
+                        (uintptr_t)device_va + g_memory_offset);
+                    uint32_t get_va = *(volatile uint32_t *)((char *)device +
+                        g_dma_get_pointer_offset);
+                    uint32_t put_value = *(volatile uint32_t *)((char *)device +
+                        g_dma_put_offset);
+                    if (get_va >= 0x00010000u && get_va < XBOX_CONTIG_SIZE) {
+                        volatile uint32_t *get = (volatile uint32_t *)(
+                            (uintptr_t)get_va + g_memory_offset);
+                        if (*get != put_value)
+                            *get = put_value;
+                    }
+                }
             }
         }
         if (g_mcpx_regs) {
@@ -250,6 +326,8 @@ ptrdiff_t g_xbox_mem_offset = 0;
 /* Global registers for recompiled code (via recomp_types.h) */
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+/* EFLAGS.DF: string instructions step backwards while set (std/cld). */
+RECOMP_TLS int g_df = 0;
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
@@ -263,6 +341,8 @@ RECOMP_TLS int g_fp_cmp = 0;
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+RECOMP_TLS uint64_t g_mm0, g_mm1, g_mm2, g_mm3;
+RECOMP_TLS uint64_t g_mm4, g_mm5, g_mm6, g_mm7;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
 RECOMP_TLS uint32_t g_ebp = 0;
@@ -616,6 +696,36 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+        /* XBOX_CONTIG_ALIAS_HEAP: alias the heap part of the window onto RAM.
+         * MmAllocateContiguousMemory hands out heap addresses and the Xbox D3D
+         * library then reaches the same buffers as 0x80000000 | physical
+         * (vertex/index buffer Lock). With separate storage those writes never
+         * reach the memory the GPU reads -- Godzilla: Save the Earth patches its
+         * skinned meshes' bone indices through Lock, and the menu Godzilla
+         * vanished. The low part (fake kernel page, pinned pools) stays separate. */
+        if (GetEnvironmentVariableA("XBOX_CONTIG_ALIAS_HEAP", NULL, 0) &&
+            g_mapping_handle && XBOX_HEAP_BASE < XBOX_CONTIG_SIZE) {
+            g_contig_memory = VirtualAlloc((LPVOID)contig_native, XBOX_HEAP_BASE,
+                                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (g_contig_memory &&
+                !MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS, 0, XBOX_HEAP_BASE,
+                                 XBOX_CONTIG_SIZE - XBOX_HEAP_BASE,
+                                 (LPVOID)(contig_native + XBOX_HEAP_BASE))) {
+                fprintf(stderr, "  WARNING: contiguous heap alias failed (error %lu)\n",
+                        GetLastError());
+            } else if (g_contig_memory) {
+                fprintf(stderr, "  Contiguous window: heap range 0x%08X+ aliases RAM\n",
+                        XBOX_CONTIG_BASE + XBOX_HEAP_BASE);
+                /* RAM above 64 MB (128 MB runs) is reached the same way once
+                 * a title turns a heap pointer into 0x80000000 | physical */
+                if (g_memory_size > XBOX_CONTIG_SIZE &&
+                    !MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS, 0, XBOX_CONTIG_SIZE,
+                                     g_memory_size - XBOX_CONTIG_SIZE,
+                                     (LPVOID)(contig_native + XBOX_CONTIG_SIZE)))
+                    fprintf(stderr, "  WARNING: contiguous alias above 64 MB failed (error %lu)\n",
+                            GetLastError());
+            }
+        } else
         g_contig_memory = VirtualAlloc(
             (LPVOID)contig_native,
             XBOX_CONTIG_SIZE,
@@ -775,6 +885,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
+            /* stay below the 0x80000000 contiguous window (128 MB runs
+             * reach it after 15 mirrors) */
+            if ((uint64_t)(m + 2) * g_memory_size > 0x80000000ull) break;
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -792,6 +905,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
                 mirrors_ok, XBOX_NUM_MIRRORS,
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+    }
+
+    /* The statically linked Xbox D3D8 library exposes resource storage through
+     * the 0xF0000000 write-combined alias. For example, LockRect may return
+     * 0xF3463000 for physical page 0x03463000. Recompiled loads/stores retain
+     * that VA, so map a second view of the RAM section at the alias instead of
+     * forcing every generated memory operation to special-case it. */
+    {
+        uintptr_t alias_native =
+            (uintptr_t)XBOX_GPU_RAM_ALIAS_BASE + g_memory_offset;
+        g_gpu_ram_alias = MapViewOfFileEx(
+            g_mapping_handle,
+            FILE_MAP_ALL_ACCESS,
+            0, 0,
+            g_memory_size,
+            (LPVOID)alias_native
+        );
+        if (g_gpu_ram_alias) {
+            fprintf(stderr,
+                    "  GPU RAM alias: %u MB at Xbox VA 0x%08X (aliases low RAM)\n",
+                    (unsigned)(g_memory_size / (1024 * 1024)),
+                    XBOX_GPU_RAM_ALIAS_BASE);
+        } else {
+            fprintf(stderr,
+                    "  WARNING: GPU RAM alias at 0x%08X failed (error %lu); "
+                    "D3D resource locks will fault\n",
+                    XBOX_GPU_RAM_ALIAS_BASE, GetLastError());
+        }
     }
 
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
@@ -843,6 +984,10 @@ void xbox_MemoryLayoutShutdown(void)
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
         g_nv2a_memory = NULL;
     }
+    if (g_gpu_ram_alias) {
+        UnmapViewOfFile(g_gpu_ram_alias);
+        g_gpu_ram_alias = NULL;
+    }
     /* Unmap mirror views first */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
         if (g_mirror_views[m]) {
@@ -880,25 +1025,36 @@ ptrdiff_t xbox_GetMemoryOffset(void)
     return g_memory_offset;
 }
 
-/* ── Dynamic heap allocator ────────────────────────────────
+/* -- Dynamic heap allocator ------------------------------------------------
  *
- * Simple bump allocator for MmAllocateContiguousMemory and similar.
- * Returns Xbox VAs within the mapped region so MEM32() works correctly.
- * No free support (bump-only for now).
+ * Returns Xbox VAs inside the mapped RAM so MEM32() works. Two arenas:
+ *
+ *   low  [XBOX_HEAP_BASE, 64 MB)  contiguous memory, pools, kernel objects --
+ *                                 anything the GPU/APU may address
+ *   high [64 MB, total RAM)       NtAllocateVirtualMemory, when the run maps
+ *                                 more than 64 MB (see xbox_SetTotalRam)
+ *
+ * The split stands in for the Xbox separating virtual reservations from
+ * physical pages: a title's XAPI heap reserves segments it commits lazily and
+ * decommits again, which costs no physical memory on hardware but a whole
+ * block here. Without the high arena Godzilla: Save the Earth ran its 64 MB out
+ * when the attract demo loaded its 15.5 MB sound bank. Each arena falls back
+ * to the other when full.
+ *
+ * Each arena is a bump pointer plus an address-ordered block table; freed
+ * blocks are split on reuse, merged with free neighbours, and returned to the
+ * bump pointer when they end at it.
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
-
+#define XBOX_HEAP_MAX_BLOCKS 32768
+typedef struct { uint32_t addr; uint32_t size; uint8_t free; } HeapBlock;
+typedef struct {
+    const char *name;
+    uint32_t base, top, next;
+    int count;
+    HeapBlock blocks[XBOX_HEAP_MAX_BLOCKS];
+} HeapArena;
+static HeapArena g_arena_low, g_arena_high;
 static int g_heap_alloc_count = 0;
-
-/* Block table backing xbox_HeapFree. A bump pointer alone never reclaims,
- * which is fine for a title that allocates once and fatal for a debug build
- * that churns. Flat array rather than an intrusive list: allocations come back
- * in bump order, so index order is address order and coalescing is a
- * neighbour check. */
-#define XBOX_HEAP_MAX_BLOCKS 65536
-static struct { uint32_t addr; uint32_t size; uint8_t free; }
-    g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
-static int g_heap_block_count = 0;
 
 /*
  * Simulated stacks for spawned threads.
@@ -928,147 +1084,252 @@ uint32_t xbox_AllocThreadStack(void)
     return base + XBOX_THREAD_STACK_SIZE - 16;
 }
 
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+static void arena_setup(void)
 {
-    uint32_t result;
+    if (g_arena_low.top) return;
+    g_arena_low.name = "low";
+    g_arena_high.name = "high";
+    g_arena_low.base = g_arena_low.next = XBOX_HEAP_BASE;
+    g_arena_low.top = XBOX_HEAP_TOP < XBOX_TOTAL_RAM ? XBOX_HEAP_TOP : XBOX_TOTAL_RAM;
+    g_arena_high.base = g_arena_high.next = g_arena_low.top;
+    g_arena_high.top = XBOX_HEAP_TOP;   /* empty when only 64 MB is mapped */
+}
 
-    if (alignment < 4) alignment = 4;
+static HeapArena *arena_of(uint32_t va)
+{
+    return va >= g_arena_high.base && va < g_arena_high.top ? &g_arena_high : &g_arena_low;
+}
 
-    /* Enforce minimum allocation size.
-     * The Xbox D3D8 code sometimes computes resource sizes from GPU
-     * capabilities that return 0 (since we don't have real NV2A hardware),
-     * resulting in zero-size allocations. With a bump allocator, these all
-     * return the same address, causing overlapping structures. Enforce a
-     * minimum of 4096 bytes so each allocation gets its own memory. */
-    if (size < 16) size = 16;
+static void arena_insert(HeapArena *a, int at, uint32_t addr, uint32_t size, uint8_t is_free)
+{
+    memmove(&a->blocks[at + 1], &a->blocks[at], (size_t)(a->count - at) * sizeof(a->blocks[0]));
+    a->blocks[at].addr = addr;
+    a->blocks[at].size = size;
+    a->blocks[at].free = is_free;
+    a->count++;
+}
 
-    /* Reuse a freed block first. Without this the heap only ever grows: Halo's
-     * debug build allocates and releases heavily through init, exhausted all
-     * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
-     * with E_OUTOFMEMORY -- which the title reports by clearing
-     * global_d3d_device, so the rasterizer asserts and startup stops. */
-    for (int i = 0; i < g_heap_block_count; i++) {
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
-            continue;
+static void arena_remove(HeapArena *a, int at)
+{
+    memmove(&a->blocks[at], &a->blocks[at + 1], (size_t)(a->count - at - 1) * sizeof(a->blocks[0]));
+    a->count--;
+}
+
+static uint32_t arena_alloc(HeapArena *a, uint32_t size, uint32_t alignment)
+{
+    uint32_t result, prev_next;
+
+    /* first fit among freed blocks, split around the aligned start */
+    for (int i = 0; i < a->count; i++) {
+        uint32_t start, lead, tail;
+        if (!a->blocks[i].free) continue;
+        start = (a->blocks[i].addr + alignment - 1) & ~(alignment - 1);
+        lead = start - a->blocks[i].addr;
+        if (a->blocks[i].size < lead || a->blocks[i].size - lead < size) continue;
+        tail = a->blocks[i].size - lead - size;
+        if (a->count + (lead != 0) + (tail != 0) > XBOX_HEAP_MAX_BLOCKS) continue;
+        if (lead) {
+            arena_insert(a, i, a->blocks[i].addr, lead, 1);
+            i++;
         }
-        if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
-        }
-        g_heap_blocks[i].free = 0;
-        result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-        return result;
+        a->blocks[i].addr = start;
+        a->blocks[i].size = size;
+        a->blocks[i].free = 0;
+        if (tail) arena_insert(a, i + 1, start + size, tail, 1);
+        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+        return start;
     }
 
-    /* Align the next pointer */
-    result = (g_heap_next + alignment - 1) & ~(alignment - 1);
-
-    if (result + size > XBOX_HEAP_TOP) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
-        /* Who ate the heap? Group live blocks by size -- an exhausted heap is
-         * nearly always one request size repeated, and the count names it. */
-        {
-            static int dumped = 0;
-            static struct { uint32_t size; int n; } hist[256];
-            if (!dumped) {
-                int used = 0;
-                dumped = 1;
-                for (int i = 0; i < g_heap_block_count; i++) {
-                    int j = 0;
-                    if (g_heap_blocks[i].free || !g_heap_blocks[i].size) continue;
-                    while (j < used && hist[j].size != g_heap_blocks[i].size) j++;
-                    if (j == used) {
-                        if (used == 256) continue;   /* ponytail: 256 distinct sizes is plenty */
-                        hist[used].size = g_heap_blocks[i].size;
-                        hist[used++].n = 0;
-                    }
-                    hist[j].n++;
-                }
-                for (int j = 0; j < used; j++) {
-                    if ((uint64_t)hist[j].n * hist[j].size < 1024 * 1024) continue;
-                    fprintf(stderr, "  [HEAP] %d live blocks of %u bytes (%u KB)\n",
-                            hist[j].n, hist[j].size,
-                            (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
-                }
-                fflush(stderr);
-            }
-        }
+    result = (a->next + alignment - 1) & ~(alignment - 1);
+    if (result < a->next || result + size < result || result + size > a->top ||
+        a->count + 2 > XBOX_HEAP_MAX_BLOCKS)
         return 0;
-    }
-
-    g_heap_next = result + size;
-
+    prev_next = a->next;
+    a->next = result + size;
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    if (result > prev_next)   /* alignment gap stays reusable */
+        arena_insert(a, a->count, prev_next, result - prev_next, 1);
+    arena_insert(a, a->count, result, size, 0);
+    return result;
+}
 
-    if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
-        g_heap_blocks[g_heap_block_count].addr = result;
-        g_heap_blocks[g_heap_block_count].size = size;
-        g_heap_blocks[g_heap_block_count].free = 0;
-        g_heap_block_count++;
+/* Who ate the heap? Group live blocks by size -- an exhausted heap is nearly
+ * always one request size repeated, and the count names it. */
+static void arena_dump(const HeapArena *a)
+{
+    static struct { uint32_t size; int n; } hist[256];
+    int used = 0;
+    for (int i = 0; i < a->count; i++) {
+        int j = 0;
+        if (a->blocks[i].free) continue;
+        while (j < used && hist[j].size != a->blocks[i].size) j++;
+        if (j == used) {
+            if (used == 256) continue;
+            hist[used].size = a->blocks[i].size;
+            hist[used++].n = 0;
+        }
+        hist[j].n++;
+    }
+    for (int j = 0; j < used; j++) {
+        if ((uint64_t)hist[j].n * hist[j].size < 1024 * 1024) continue;
+        fprintf(stderr, "  [HEAP] %s: %d live blocks of %u bytes (%u KB)\n", a->name,
+                hist[j].n, hist[j].size, (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
+    }
+}
+
+static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment, int high_first)
+{
+    HeapArena *first, *second;
+    uint32_t result;
+
+    arena_setup();
+    if (alignment < 4) alignment = 4;
+    /* Zero-size requests (D3D sizes some resources from GPU caps we do not
+     * model) must still get distinct memory. */
+    if (size < 16) size = 16;
+    /* Page-aligned requests (virtual memory, contiguous memory) get whole
+     * pages, as on hardware: callers use the rest of the page (DirectSound
+     * keeps its pool list there), so it must never be handed out again. */
+    if (alignment >= 4096) size = (size + 4095) & ~4095u;
+
+    first = high_first ? &g_arena_high : &g_arena_low;
+    second = high_first ? &g_arena_low : &g_arena_high;
+    result = arena_alloc(first, size, alignment);
+    if (!result) result = arena_alloc(second, size, alignment);
+    if (!result) {
+        static int dumped;
+        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u; low used %u/%u, high used %u/%u)\n",
+                size, g_arena_low.next - g_arena_low.base, g_arena_low.top - g_arena_low.base,
+                g_arena_high.next - g_arena_high.base, g_arena_high.top - g_arena_high.base);
+        if (!dumped) {
+            dumped = 1;
+            arena_dump(&g_arena_low);
+            arena_dump(&g_arena_high);
+        }
+        fflush(stderr);
+        return 0;
     }
 
     g_heap_alloc_count++;
     /* Rate-limited: a debug title makes thousands of these and the log is a
      * diagnostic, not a transaction record. */
     if (g_heap_alloc_count <= 32 || (g_heap_alloc_count % 512) == 0) {
-        fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
+        fprintf(stderr, "  [HEAP] #%d: size=%u align=%u -> 0x%08X..0x%08X (low used %u, high used %u)\n",
                 g_heap_alloc_count, size, alignment, result, result + size,
-                g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
-        fflush(stderr);
+                g_arena_low.next - g_arena_low.base, g_arena_high.next - g_arena_high.base);
     }
-
     return result;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+/* Size of the live heap block starting at xbox_va (0 if unknown). Backs
+ * MmQueryAllocationSize / ExQueryPoolBlockSize: DirectSound sizes the
+ * scatter-gather table it hands the APU from MmQueryAllocationSize. */
+static uint32_t heap_query_size_unlocked(uint32_t xbox_va)
 {
-    static int frees = 0, matched = 0;
+    HeapArena *a = arena_of(xbox_va);
+    int lo = 0, hi = a->count - 1;
+    while (lo <= hi) {   /* table is address ordered */
+        int mid = (lo + hi) / 2;
+        if (a->blocks[mid].addr == xbox_va)
+            return a->blocks[mid].free ? 0 : a->blocks[mid].size;
+        if (a->blocks[mid].addr < xbox_va) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
 
-    if (!xbox_va) {
+static void heap_free_unlocked(uint32_t xbox_va)
+{
+    HeapArena *a = arena_of(xbox_va);
+    int lo = 0, hi = a->count - 1, i = -1;
+
+    if (!xbox_va) return;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (a->blocks[mid].addr == xbox_va) { i = mid; break; }
+        if (a->blocks[mid].addr < xbox_va) lo = mid + 1; else hi = mid - 1;
+    }
+    if (i < 0 || a->blocks[i].free) {
+        static int misses;
+        if (misses++ < 20)
+            fprintf(stderr, "  [HEAP] free of unknown block 0x%08X (%s)\n", xbox_va,
+                    i < 0 ? "no block starts here" : "already free");
         return;
     }
-    frees++;
-    if (frees <= 8) {
-        fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
-                frees, xbox_va, g_heap_block_count);
-        fflush(stderr);
+    a->blocks[i].free = 1;
+    /* Coalesce with neighbours (table is address ordered). */
+    if (i + 1 < a->count && a->blocks[i + 1].free &&
+        a->blocks[i].addr + a->blocks[i].size == a->blocks[i + 1].addr) {
+        a->blocks[i].size += a->blocks[i + 1].size;
+        arena_remove(a, i + 1);
     }
-    for (int i = 0; i < g_heap_block_count; i++) {
-        if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
-            continue;
-        }
-        g_heap_blocks[i].free = 1;
-        if (++matched % 512 == 0) {
-            fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
-                    frees, matched, g_heap_block_count);
-            fflush(stderr);
-        }
-
-        /* Coalesce with neighbours. Blocks are recorded in bump order, so
-         * index order is address order and adjacency is a simple end==start
-         * test. Keeps large contiguous requests satisfiable after a lot of
-         * small churn. */
-        if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
-            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
-            g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
-        }
-        if (i > 0 && g_heap_blocks[i - 1].free &&
-            g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
-            g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
-        }
-        return;
+    if (i > 0 && a->blocks[i - 1].free &&
+        a->blocks[i - 1].addr + a->blocks[i - 1].size == a->blocks[i].addr) {
+        a->blocks[i - 1].size += a->blocks[i].size;
+        arena_remove(a, i);
+        i--;
+    }
+    /* a free block at the top goes back to the bump pointer */
+    if (i == a->count - 1 && a->blocks[i].addr + a->blocks[i].size == a->next) {
+        a->next = a->blocks[i].addr;
+        a->count--;
     }
 }
 
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
+}
+
+/* Guest threads run on real host threads and allocate concurrently (XAPI heap
+ * growth, D3D, DirectSound), so the block tables need a lock. */
+static SRWLOCK g_heap_lock = SRWLOCK_INIT;
+
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    r = heap_alloc_unlocked(size, alignment, 0);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return r;
+}
+
+/* NtAllocateVirtualMemory: prefer the high arena (nothing there is reached
+ * through a physical address). */
+uint32_t xbox_HeapAllocVirtual(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    r = heap_alloc_unlocked(size, alignment, 1);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return r;
+}
+
+static uint32_t heap_canonical(uint32_t va);
+
+uint32_t xbox_HeapQuerySize(uint32_t xbox_va)
+{
+    uint32_t r;
+    xbox_va = heap_canonical(xbox_va);
+    AcquireSRWLockShared(&g_heap_lock);
+    r = heap_query_size_unlocked(xbox_va);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return r;
+}
+
+/* Callers may hand back a block through the 0x80000000 (contiguous) or
+ * 0xF0000000 (write-combined) alias of its physical address. */
+static uint32_t heap_canonical(uint32_t va)
+{
+    if (va >= 0x80000000u && va - 0x80000000u < (uint32_t)g_memory_size) return va - 0x80000000u;
+    if (va >= 0xF0000000u && va - 0xF0000000u < (uint32_t)g_memory_size) return va - 0xF0000000u;
+    return va;
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    xbox_va = heap_canonical(xbox_va);
+    AcquireSRWLockExclusive(&g_heap_lock);
+    heap_free_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_heap_lock);
 }

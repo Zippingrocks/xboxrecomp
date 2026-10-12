@@ -188,6 +188,22 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         }
         break;
 
+    case 0x104: /* XC_FACTORY_AV_REGION: NTSC-M, xemu's default EEPROM */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 0x00400100;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case 0x105: /* XC_FACTORY_GAME_REGION: North America */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 1;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
     default:
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
             "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
@@ -225,6 +241,11 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
     (void)Verify;
+    /* XBOX_PHY_NO_LINK: report the cable unplugged, as the real kernel does
+     * under xemu without a network backend. With a link XNet starts DHCP,
+     * which nothing answers, and titles that wait for XNetGetTitleXnAddr to
+     * leave PENDING (Godzilla: Save the Earth) hang at boot. */
+    if (GetEnvironmentVariableA("XBOX_PHY_NO_LINK", NULL, 0)) return 0;
     /* Return link up, 100 Mbps, full duplex */
     return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
 }

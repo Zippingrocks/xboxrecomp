@@ -46,6 +46,25 @@ LGPL-2.1-or-later — extracted from xemu
   satisfies that.
 
 
+GPL-2.0-or-later — extracted or ported from xemu
+-------------------------------------------------
+
+  https://github.com/xemu-project/xemu
+
+  The MCPX DSP interpreter under `src/apu/dsp/` is adapted from xemu and its
+  Hatari/ARAnyM ancestry. Individual source files retain their original
+  copyright and GPL notices.
+
+  `src/d3d/d3d8_nv2a_psh.c` and `.h` are a source-level HLSL port of xemu's
+  NV2A register-combiner generator, contributed to this branch under the same
+  GPL-2.0-or-later terms.
+
+  These components are licensed under the GNU General Public License,
+  version 2 or (at your option) any later version. The full GPL version 2 text
+  is in `LICENSES/GPL-2.0.txt`. Distributing a linked executable that contains
+  these components invokes the GPL's corresponding-source requirements.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 

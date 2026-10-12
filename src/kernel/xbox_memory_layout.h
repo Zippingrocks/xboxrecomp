@@ -253,6 +253,9 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */
 void xbox_HeapFree(uint32_t xbox_va);
+/* NtAllocateVirtualMemory backing: prefers RAM above 64 MB when mapped. */
+uint32_t xbox_HeapAllocVirtual(uint32_t size, uint32_t alignment);
+uint32_t xbox_HeapQuerySize(uint32_t xbox_va);
 
 /**
  * Get the file mapping handle for the Xbox memory region.
@@ -260,6 +263,13 @@ void xbox_HeapFree(uint32_t xbox_va);
  * Returns NULL if file mapping is not available.
  */
 HANDLE xbox_GetMappingHandle(void);
+
+/* Configure a title's D3D command-consumer shadow. Some XDK D3D builds keep
+ * DMA_GET in a dynamically allocated block instead of the fixed USER aperture.
+ * All arguments are Xbox virtual addresses/byte offsets; zero disables it. */
+void xbox_Nv2aConfigureDmaProgress(uint32_t device_pointer_va,
+                                   uint32_t dma_put_offset,
+                                   uint32_t dma_get_pointer_offset);
 
 #ifdef __cplusplus
 }
@@ -285,5 +295,7 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline 
 #define XBOX_THREAD_MODE_INLINE 0
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);
+/* Pin the calling host thread to the guest CPU core (see kernel_bridge.c). */
+void xbox_guest_thread_pin(void);
 
 #endif /* XBOX_MEMORY_LAYOUT_H */

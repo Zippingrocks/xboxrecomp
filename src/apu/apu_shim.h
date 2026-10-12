@@ -355,6 +355,8 @@ static struct {
     struct {
         float volume_limit;
         bool hrtf;
+        bool use_dsp;      /* run the GP/EP DSPs (xemu "use_dsp") */
+        bool use_dsp_jit;  /* interpreter only in this build */
         struct {
             int num_workers;
         } vp;
@@ -363,6 +365,8 @@ static struct {
     .audio = {
         .volume_limit = 1.0f,
         .hrtf = false,
+        .use_dsp = false, /* xemu default: DSPs step 1000 cycles/frame, output at VP */
+        .use_dsp_jit = false,
         .vp = { .num_workers = 1 },
     },
 };

@@ -35,6 +35,15 @@ static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
  */
+/* Raising to DISPATCH_LEVEL or above excludes the interrupt/DPC thread
+ * (kernel_bridge.c), as it excludes interrupts and DPCs on the console. */
+extern void xbox_irql_cross(int raising);
+
+void xbox_irq_thread_set_irql(int dispatch)
+{
+    g_current_irql = dispatch ? DISPATCH_LEVEL : PASSIVE_LEVEL;
+}
+
 KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
     KIRQL old = g_current_irql;
@@ -43,8 +52,11 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfRaiseIrql: attempt to lower IRQL from %d to %d (use KfLowerIrql)",
             old, NewIrql);
+        return old;
     }
 
+    if (old < DISPATCH_LEVEL && NewIrql >= DISPATCH_LEVEL)
+        xbox_irql_cross(1);
     g_current_irql = NewIrql;
     return old;
 }
@@ -59,8 +71,11 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
+        return;
     }
 
+    if (g_current_irql >= DISPATCH_LEVEL && NewIrql < DISPATCH_LEVEL)
+        xbox_irql_cross(0);
     g_current_irql = NewIrql;
 }
 
@@ -70,7 +85,10 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
-    g_current_irql = DISPATCH_LEVEL;
+    if (old < DISPATCH_LEVEL) {
+        xbox_irql_cross(1);
+        g_current_irql = DISPATCH_LEVEL;
+    }
     return old;
 }
 
@@ -99,8 +117,18 @@ static void xbox_update_tick_count(void)
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
+    /* On the console the counter starts near zero at boot. The host's has
+     * been running since the PC booted (days), and titles that turn tick
+     * counts into float seconds lose all precision or overflow their
+     * arithmetic -- report time since the first query instead. */
+    static LONGLONG base;
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
+    if (!base) {
+        LONGLONG expect = 0;
+        InterlockedCompareExchange64(&base, counter.QuadPart - 1, expect);
+    }
+    counter.QuadPart -= base;
     return counter;
 }
 
@@ -244,8 +272,21 @@ VOID __stdcall xbox_HalReadWritePCISpace(
  * exit the game cleanly.
  * ============================================================================ */
 
+static BOOLEAN g_ignore_quick_reboot;
+
+void xbox_kernel_ignore_quick_reboot(BOOLEAN ignore)
+{
+    g_ignore_quick_reboot = ignore;
+}
+
 VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
+    if (g_ignore_quick_reboot && Routine == 2) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
+            "HalReturnToFirmware: ignoring title-scoped quick reboot request");
+        return;
+    }
+
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
     ExitProcess(0);
@@ -439,8 +480,12 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     switch (Option) {
     case AV_OPTION_QUERY_AVPACK:
-        /* Report HDTV/Component pack - allows games to offer 480p/720p */
-        *Result = AV_PACK_HDTV;
+        /* Retail XDK callers use more than the low AV-pack byte: the video
+         * standard/capability bits select a row in their packed display-mode
+         * table.  DAMM's Xemu reference reports 0x00400104 for its HDTV NTSC
+         * configuration; returning only AV_PACK_HDTV selects an incompatible
+         * row and makes D3D tear its device back down during startup. */
+        *Result = 0x00400104u;
         break;
 
     case AV_OPTION_QUERY_MODE:

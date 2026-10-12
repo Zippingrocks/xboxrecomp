@@ -73,7 +73,10 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...)
     va_end(args);
 
     fprintf(out, "\n");
-    fflush(out);
+    /* the log file is block-buffered (flushing every line stalled callers
+     * on slow disks); errors still go out at once */
+    if (out != g_log_file || level <= XBOX_LOG_ERROR)
+        fflush(out);
 
     if (g_log_cs_init)
         LeaveCriticalSection(&g_log_cs);
@@ -395,6 +398,7 @@ void xbox_kernel_init(void)
 
     /* Try to open log file, fall back to stderr */
     g_log_file = fopen("xbox_kernel.log", "w");
+    if (g_log_file) setvbuf(g_log_file, NULL, _IOFBF, 1 << 16);
 
     /* Set log level from environment variable if present */
     const char* log_env = getenv("XBOX_LOG_LEVEL");

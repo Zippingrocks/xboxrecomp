@@ -34,6 +34,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_combiners.h"
+#include "d3d8_nv2a_psh.h"
 #include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
@@ -987,6 +988,10 @@ BOOL d3d8_combiners_prepare_draw(void)
     const DWORD *rs;
     HRESULT hr;
     int i;
+
+    /* Raw NV2A combiner state from the pushbuffer translator wins */
+    if (d3d8_nv2a_psh_prepare_draw())
+        return TRUE;
 
     /* Not using combiner shaders - fall back to fixed-function */
     if (g_ps_token == 0)

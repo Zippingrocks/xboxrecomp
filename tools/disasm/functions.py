@@ -84,6 +84,7 @@ class FunctionDetector:
         # function's end. Kept out of self._candidates so they cannot truncate
         # the function they land in.
         self._alias_entries: Dict[int, int] = {}
+        self._explicit_alias_entries: Set[int] = set()
 
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
@@ -136,6 +137,41 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # Explicit measured indirect targets that already decoded inside a
+        # function are callable interior entries, not new hard boundaries.
+        # Give each one an overlapping body through its containing function's
+        # end, exactly like the tail-jump aliases above.
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        orphan_entries = []
+        for addr in sorted(self._explicit_alias_entries):
+            if addr in self.functions:
+                continue
+            i = bisect.bisect_right(starts, addr) - 1
+            if i >= 0 and bodies[i][0] < addr < bodies[i][1]:
+                self._alias_entries[addr] = bodies[i][1]
+            else:
+                orphan_entries.append(addr)
+
+        # A measured entry can also land in a reachability hole left by the
+        # linear function builder (common after a jump-table arm returns while
+        # later arms continue in the byte stream). In that case it is a genuine
+        # standalone fragment boundary. Rebuild once with those boundaries,
+        # then resolve the remaining interior entries against the new bodies.
+        if orphan_entries:
+            for addr in orphan_entries:
+                self._add_candidate(addr, 0.95, "seed_indirect_fragment")
+            self.functions.clear()
+            self._build_functions(sections)
+            bodies = sorted((f.start, f.end) for f in self.functions.values())
+            starts = [b[0] for b in bodies]
+            for addr in sorted(self._explicit_alias_entries):
+                if addr in self.functions:
+                    continue
+                i = bisect.bisect_right(starts, addr) - 1
+                if i >= 0 and bodies[i][0] < addr < bodies[i][1]:
+                    self._alias_entries[addr] = bodies[i][1]
+
         self._build_alias_entries()
 
         # Populate call graph
@@ -148,6 +184,10 @@ class FunctionDetector:
         existing = self._candidates.get(addr)
         if existing is None or confidence > existing[0]:
             self._candidates[addr] = (confidence, method)
+
+    def add_explicit_alias_entry(self, addr: int) -> None:
+        """Request a callable overlapping entry at an existing instruction."""
+        self._explicit_alias_entries.add(addr)
 
     def _pass_known_addresses(self) -> None:
         """Pass 1: Add known function addresses."""

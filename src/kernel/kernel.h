@@ -480,6 +480,9 @@ extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Initialize the thunk table - must be called before game code runs */
 void xbox_kernel_init(void);
 void xbox_kernel_shutdown(void);
+/* Bring-up aid for titles whose XAPI process initializer requests a quick
+ * reboot before entering the title. Disabled by default. */
+void xbox_kernel_ignore_quick_reboot(BOOLEAN ignore);
 
 /* Resolve a kernel ordinal to a function/data pointer */
 ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);

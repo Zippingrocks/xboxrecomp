@@ -58,9 +58,19 @@ def test_every_route_matches_its_ordinal():
                 f"ordinal {ordinal} -> bridge_{name}, but ordinal {ordinal} "
                 f"is {expected}")
 
-    # KeSetTimerEx is knowingly served by the KeSetTimer bridge; the extra
-    # Period argument is dropped. Tracked, not silently accepted.
-    known = {"ordinal 150 -> bridge_KeSetTimer, but ordinal 150 is KeSetTimerEx"}
+    # Some exports intentionally use specialized wrappers or share a bridge.
+    # Keep every exception explicit so a genuinely misrouted ordinal cannot be
+    # hidden by a broad suffix/prefix rule.
+    known = {
+        "ordinal 97 -> bridge_KeCancelTimerReal, but ordinal 97 is KeCancelTimer",
+        "ordinal 98 -> bridge_KeConnectInterruptReal, but ordinal 98 is KeConnectInterrupt",
+        "ordinal 139 -> bridge_KeFloatingPointStateNoop, but ordinal 139 is KeRestoreFloatingPointState",
+        "ordinal 142 -> bridge_KeFloatingPointStateNoop, but ordinal 142 is KeSaveFloatingPointState",
+        "ordinal 149 -> bridge_KeSetTimerReal, but ordinal 149 is KeSetTimer",
+        "ordinal 150 -> bridge_KeSetTimerExReal, but ordinal 150 is KeSetTimerEx",
+        "ordinal 160 -> bridge_KfRaiseIrqlFast, but ordinal 160 is KfRaiseIrql",
+        "ordinal 161 -> bridge_KfLowerIrqlFast, but ordinal 161 is KfLowerIrql",
+    }
     bad = [b for b in bad if b not in known]
 
     assert not bad, "misrouted kernel ordinals:\n  " + "\n  ".join(bad)

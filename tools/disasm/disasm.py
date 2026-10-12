@@ -157,7 +157,16 @@ class Disassembler:
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
             for addr in self.seed_functions:
-                self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
+                if addr in self.engine.instructions:
+                    # Preserve the containing body. If another detection pass
+                    # independently proves this is a normal function start the
+                    # alias request becomes a harmless no-op.
+                    self.func_detector.add_explicit_alias_entry(addr)
+                elif self.engine.decode_at(addr):
+                    # Explicit runtime evidence is sufficient to realign a
+                    # linear sweep that crossed embedded data.
+                    self.func_detector._add_candidate(
+                        addr, 0.95, "seed_vtable_thunk")
             if self.verbose:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 

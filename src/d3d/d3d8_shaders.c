@@ -72,20 +72,20 @@ static const char g_vs_source[] =
     "    float3 normal   : NORMAL;\n"
     "    float4 diffuse  : COLOR0;\n"
     "    float4 specular : COLOR1;\n"
-    "    float2 tex0     : TEXCOORD0;\n"
-    "    float2 tex1     : TEXCOORD1;\n"
-    "    float2 tex2     : TEXCOORD2;\n"
-    "    float2 tex3     : TEXCOORD3;\n"
+    "    float4 tex0     : TEXCOORD0;\n"
+    "    float4 tex1     : TEXCOORD1;\n"
+    "    float4 tex2     : TEXCOORD2;\n"
+    "    float4 tex3     : TEXCOORD3;\n"
     "};\n"
     "\n"
     "struct VS_OUT {\n"
     "    float4 pos      : SV_POSITION;\n"
     "    float4 diffuse  : COLOR0;\n"
     "    float4 specular : COLOR1;\n"
-    "    float2 tex0     : TEXCOORD0;\n"
-    "    float2 tex1     : TEXCOORD1;\n"
-    "    float2 tex2     : TEXCOORD2;\n"
-    "    float2 tex3     : TEXCOORD3;\n"
+    "    float4 tex0     : TEXCOORD0;\n"
+    "    float4 tex1     : TEXCOORD1;\n"
+    "    float4 tex2     : TEXCOORD2;\n"
+    "    float4 tex3     : TEXCOORD3;\n"
     "    float  fog      : TEXCOORD4;\n"
     "};\n"
     "\n"
@@ -121,10 +121,14 @@ static const char g_vs_source[] =
     "    o.specular = float4(0, 0, 0, 0);\n"
     "\n"
     "    if (Flags & FLAG_PRETRANSFORMED) {\n"
-    "        o.pos.x = (input.pos.x / ScreenSize.x) * 2.0 - 1.0;\n"
-    "        o.pos.y = 1.0 - (input.pos.y / ScreenSize.y) * 2.0;\n"
-    "        o.pos.z = input.pos.z;\n"
-    "        o.pos.w = 1.0;\n"
+    /* XYZRHW is a homogeneous position divided through by w: rebuild clip
+     * space (w = 1/rhw) so the rasteriser clips geometry behind the eye and
+     * interpolates perspective-correctly. */
+    "        float pw = (input.pos.w != 0.0) ? 1.0 / input.pos.w : 1.0;\n"
+    "        o.pos.x = ((input.pos.x / ScreenSize.x) * 2.0 - 1.0) * pw;\n"
+    "        o.pos.y = (1.0 - (input.pos.y / ScreenSize.y) * 2.0) * pw;\n"
+    "        o.pos.z = input.pos.z * pw;\n"
+    "        o.pos.w = pw;\n"
     "        o.diffuse = (Flags & FLAG_HAS_DIFFUSE) ? input.diffuse.bgra : float4(1,1,1,1);\n"
     "        if (Flags & FLAG_HAS_SPECULAR) o.specular = input.specular.bgra;\n"
     "        return o;\n"
@@ -235,18 +239,18 @@ static const char g_ps_source[] =
     "    float4 pos      : SV_POSITION;\n"
     "    float4 diffuse  : COLOR0;\n"
     "    float4 specular : COLOR1;\n"
-    "    float2 tex0     : TEXCOORD0;\n"
-    "    float2 tex1     : TEXCOORD1;\n"
-    "    float2 tex2     : TEXCOORD2;\n"
-    "    float2 tex3     : TEXCOORD3;\n"
+    "    float4 tex0     : TEXCOORD0;\n"
+    "    float4 tex1     : TEXCOORD1;\n"
+    "    float4 tex2     : TEXCOORD2;\n"
+    "    float4 tex3     : TEXCOORD3;\n"
     "    float  fog      : TEXCOORD4;\n"
     "};\n"
     "\n"
     "float4 sample_tex(uint stage, PS_IN input) {\n"
-    "    if (stage == 0) return tex0.Sample(samp0, input.tex0);\n"
-    "    if (stage == 1) return tex1.Sample(samp1, input.tex1);\n"
-    "    if (stage == 2) return tex2.Sample(samp2, input.tex2);\n"
-    "    return tex3.Sample(samp3, input.tex3);\n"
+    "    if (stage == 0) return tex0.Sample(samp0, input.tex0.xy);\n"
+    "    if (stage == 1) return tex1.Sample(samp1, input.tex1.xy);\n"
+    "    if (stage == 2) return tex2.Sample(samp2, input.tex2.xy);\n"
+    "    return tex3.Sample(samp3, input.tex3.xy);\n"
     "}\n"
     "\n"
     /* Resolve a texture argument value */
@@ -294,10 +298,10 @@ static const char g_ps_source[] =
     "    float4 texels[4];\n"
     "\n"
     "    // Pre-sample all textures\n"
-    "    texels[0] = tex0.Sample(samp0, input.tex0);\n"
-    "    texels[1] = tex1.Sample(samp1, input.tex1);\n"
-    "    texels[2] = tex2.Sample(samp2, input.tex2);\n"
-    "    texels[3] = tex3.Sample(samp3, input.tex3);\n"
+    "    texels[0] = tex0.Sample(samp0, input.tex0.xy);\n"
+    "    texels[1] = tex1.Sample(samp1, input.tex1.xy);\n"
+    "    texels[2] = tex2.Sample(samp2, input.tex2.xy);\n"
+    "    texels[3] = tex3.Sample(samp3, input.tex3.xy);\n"
     "\n"
     "    // Process up to 4 texture stages\n"
     "    [unroll] for (uint i = 0; i < 4; i++) {\n"
@@ -514,8 +518,14 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
         UINT t;
         for (t = 0; t < 4; t++) {
             if (t < tex_count) {
-                elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"TEXCOORD", t, DXGI_FORMAT_R32G32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-                elem_count++; offset += 8;
+                /* D3DFVF_TEXCOORDSIZEn: 2 bits per set at bit 16 + 2t
+                 * (0 = 2 floats, 1 = 3, 2 = 4, 3 = 1) */
+                static const DXGI_FORMAT fmts[4] = { DXGI_FORMAT_R32G32_FLOAT,
+                    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_FLOAT };
+                static const UINT sizes[4] = { 8, 12, 16, 4 };
+                UINT sz = (fvf >> (16 + 2 * t)) & 3;
+                elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"TEXCOORD", t, fmts[sz], 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
+                elem_count++; offset += sizes[sz];
             } else {
                 elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"TEXCOORD", t, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
                 elem_count++;
